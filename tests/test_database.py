@@ -30,6 +30,46 @@ class DatabaseTests(unittest.TestCase):
         self.assertFalse(self.add(2, size=999))
         self.assertTrue(self.add(3, duration=60, size=1_000))
 
+    def test_undated_media_ignores_length_but_still_obeys_size(self) -> None:
+        self.assertTrue(self.add(1, duration=0, size=1_000))
+        self.assertFalse(self.add(2, duration=0, size=999))
+
+    def test_selected_media_types_are_persistent_and_filter_new_rows(self) -> None:
+        self.db.add_channel("test", 123, "Test", "Test", 60, 1_000, ("mp4", ".jpg"))
+        channel = self.db.channels()[0]
+        self.assertEqual((".jpg", ".mp4"), channel.media_types)
+        self.assertTrue(self.db.add_media(
+            channel=channel, message_id=1, document_id=1, file_name="clip.mp4",
+            size_bytes=5_000, duration_seconds=120, message_date="", priority=10,
+        ))
+        self.assertTrue(self.db.add_media(
+            channel=channel, message_id=2, document_id=2, file_name="photo.jpg",
+            size_bytes=5_000, duration_seconds=0, message_date="", priority=10,
+        ))
+        self.assertFalse(self.db.add_media(
+            channel=channel, message_id=3, document_id=3, file_name="song.mp3",
+            size_bytes=5_000, duration_seconds=120, message_date="", priority=10,
+        ))
+        self.assertEqual((".jpg", ".mp4"), Database(self.path).channels()[0].media_types)
+
+    def test_readding_with_selected_types_discards_existing_unselected_rows(self) -> None:
+        self.assertTrue(self.add(1))
+        downloaded = self.db.next_queued()
+        self.db.mark_downloading(int(downloaded["id"]))
+        self.db.mark_downloaded(int(downloaded["id"]), "song-1.mp3", 5_000)
+        self.assertTrue(self.db.add_media(
+            channel=self.channel, message_id=2, document_id=2, file_name="photo.jpg",
+            size_bytes=5_000, duration_seconds=0, message_date="", priority=10,
+        ))
+        self.db.add_channel("test", 123, "Test", "Test", 60, 1_000, (".jpg",))
+        remaining = self.db.media_for_channel(self.channel.id)
+        self.assertEqual(
+            {"song-1.mp3", "photo.jpg"},
+            {str(row["file_name"]) for row in remaining},
+        )
+        kept_download = next(row for row in remaining if row["file_name"] == "song-1.mp3")
+        self.assertEqual("downloaded", kept_download["status"])
+
     def test_live_item_has_priority_over_backlog(self) -> None:
         self.add(1, priority=10)
         self.add(2, priority=0)
@@ -70,6 +110,18 @@ class DatabaseTests(unittest.TestCase):
         self.assertIsNone(self.db.claim_next_queued())
         self.db.mark_downloaded(first["id"], "song.mp3", first["size_bytes"])
         self.assertIsNotNone(self.db.claim_next_queued())
+
+    def test_paused_channel_is_persistent_and_skipped_by_queue(self) -> None:
+        self.add(1)
+        self.db.set_channel_paused(self.channel.id, True)
+        self.assertTrue(self.db.channels(enabled_only=True)[0].paused)
+        self.assertIsNone(self.db.next_queued())
+        self.assertEqual({}, self.db.queue_positions())
+
+        reopened = Database(self.path)
+        self.assertTrue(reopened.channels(enabled_only=True)[0].paused)
+        reopened.set_channel_paused(self.channel.id, False)
+        self.assertEqual(1, reopened.next_queued()["message_id"])
 
     def test_downloaded_and_pending_queries_are_separate_and_paged(self) -> None:
         self.add(1)
@@ -131,6 +183,31 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.channel.id, restored_id)
         self.assertEqual(1, self.db.status_count(restored_id, "downloaded"))
         self.assertEqual("Test restored", self.db.channels(enabled_only=True)[0].title)
+
+    def test_readding_reapplies_thresholds_but_preserves_downloaded_history(self) -> None:
+        for message_id, duration, size in (
+            (1, 120, 5_000),
+            (2, 240, 7_000),
+            (3, 240, 5_000),
+            (4, 120, 7_000),
+        ):
+            self.add(message_id, duration=duration, size=size)
+
+        rows = {int(row["message_id"]): row for row in self.db.media_for_channel(self.channel.id)}
+        self.db.mark_downloading(int(rows[1]["id"]))
+        self.db.mark_downloaded(int(rows[1]["id"]), "small-downloaded.mp3", 5_000)
+        self.db.mark_downloading(int(rows[2]["id"]))
+        self.db.mark_downloaded(int(rows[2]["id"]), "kept-downloaded.mp3", 7_000)
+        self.db.mark_downloading(int(rows[3]["id"]))
+        self.db.mark_failed(int(rows[3]["id"]), "test failure")
+
+        restored_id = self.db.add_channel("test", 123, "Test", "Test", 180, 6_000)
+        remaining = self.db.media_for_channel(restored_id)
+        self.assertEqual([1, 2], sorted(int(row["message_id"]) for row in remaining))
+        self.assertTrue(all(row["status"] == "downloaded" for row in remaining))
+        restored = self.db.channels(enabled_only=True)[0]
+        self.assertEqual(180, restored.min_duration_seconds)
+        self.assertEqual(6_000, restored.min_size_bytes)
 
 
 if __name__ == "__main__":

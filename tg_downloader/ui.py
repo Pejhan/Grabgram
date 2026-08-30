@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -36,6 +37,7 @@ except ImportError:
 ICON_NAMES = (
     "add", "collapse", "expand", "failed", "pause",
     "play", "queue", "refresh", "settings", "success",
+    "previous", "next", "remove",
 )
 
 
@@ -108,6 +110,64 @@ class IconButton(ttk.Button):
         self.tooltip.set_text(tooltip)
 
 
+def suggested_channel_folder(identifier: str) -> str:
+    value = identifier.strip().split("?", 1)[0].rstrip("/")
+    if "t.me/" in value.lower():
+        value = value.rsplit("/", 1)[-1]
+    value = value.lstrip("@").strip()
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+
+
+class FileTypeDialog(tk.Toplevel):
+    def __init__(
+        self, parent: tk.Misc, file_types: list[tuple[str, int]],
+        selected: tuple[str, ...], on_apply: Any,
+    ):
+        super().__init__(parent)
+        self.parent_dialog = parent
+        self.file_types = file_types
+        self.on_apply = on_apply
+        self.title("Select file types")
+        self.resizable(False, True)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+        ttk.Label(
+            self, text="Select one or more file types. Most common types appear first.",
+        ).pack(anchor="w", padx=12, pady=(12, 7))
+        self.listbox = tk.Listbox(
+            self, selectmode="multiple", exportselection=False,
+            width=38, height=min(12, max(4, len(file_types))),
+        )
+        self.listbox.pack(fill="both", expand=True, padx=12)
+        selected_set = set(selected)
+        for index, (extension, count) in enumerate(file_types):
+            self.listbox.insert("end", f"{extension}    {count:,} files")
+            if not selected_set or extension in selected_set:
+                self.listbox.selection_set(index)
+
+        actions = ttk.Frame(self)
+        actions.pack(fill="x", padx=12, pady=12)
+        ttk.Button(actions, text="Cancel", command=self.close).pack(side="right", padx=(8, 0))
+        ttk.Button(actions, text="Use selected", command=self.apply).pack(side="right")
+        self.grab_set()
+        self.listbox.focus_set()
+
+    def apply(self) -> None:
+        indexes = self.listbox.curselection()
+        if not indexes:
+            messagebox.showwarning("No file types", "Select at least one file type.", parent=self)
+            return
+        self.on_apply(tuple(self.file_types[index][0] for index in indexes))
+        self.close()
+
+    def close(self) -> None:
+        self.grab_release()
+        self.destroy()
+        if self.parent_dialog.winfo_exists():
+            self.parent_dialog.grab_set()
+
+
 class AddChannelDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, engine: DownloaderEngine):
         super().__init__(parent)
@@ -119,24 +179,104 @@ class AddChannelDialog(tk.Toplevel):
         self.columnconfigure(1, weight=1)
         self.identifier = tk.StringVar()
         self.folder = tk.StringVar()
-        self.duration = tk.StringVar(value="0")
-        self.size = tk.StringVar(value="0")
-        fields = (
-            ("Channel username, link, or ID:", self.identifier),
-            ("Download folder:", self.folder),
-            ("Minimum length (minutes):", self.duration),
-            ("Minimum size (MB):", self.size),
+        self.duration = tk.StringVar(value="1")
+        self.size = tk.StringVar(value="2")
+        self.file_types_text = tk.StringVar(value="All file types")
+        self.selected_file_types: tuple[str, ...] = ()
+        self.available_file_types: list[tuple[str, int]] = []
+        self.inspect_request_id: str | None = None
+        self.folder_edited = False
+        self.setting_folder = False
+
+        ttk.Label(self, text="Channel username, link, or ID:").grid(row=0, column=0, sticky="w", padx=12, pady=7)
+        self.identifier_entry = ttk.Entry(self, textvariable=self.identifier, width=42)
+        self.identifier_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(0, 12), pady=7)
+        ttk.Label(self, text="Download folder:").grid(row=1, column=0, sticky="w", padx=12, pady=7)
+        ttk.Entry(self, textvariable=self.folder, width=42).grid(
+            row=1, column=1, columnspan=2, sticky="ew", padx=(0, 12), pady=7,
         )
-        for row, (label, variable) in enumerate(fields):
-            ttk.Label(self, text=label).grid(row=row, column=0, sticky="w", padx=12, pady=7)
-            ttk.Entry(self, textvariable=variable, width=42).grid(row=row, column=1, sticky="ew", padx=(0, 12), pady=7)
+        ttk.Label(self, text="File types:").grid(row=2, column=0, sticky="w", padx=12, pady=7)
+        ttk.Entry(self, textvariable=self.file_types_text, state="readonly", width=36).grid(
+            row=2, column=1, sticky="ew", pady=7,
+        )
+        self.refresh_types_button = IconButton(
+            self, "refresh", "Fetch file types", command=self.refresh_file_types,
+        )
+        self.refresh_types_button.grid(row=2, column=2, padx=(6, 12), pady=7)
+        ttk.Label(self, text="Minimum length (minutes):").grid(row=3, column=0, sticky="w", padx=12, pady=7)
+        ttk.Combobox(
+            self, textvariable=self.duration, values=("1", "2", "5", "10", "60"),
+            state="readonly", width=12,
+        ).grid(row=3, column=1, sticky="w", pady=7)
+        ttk.Label(self, text="Minimum size (MB):").grid(row=4, column=0, sticky="w", padx=12, pady=7)
+        ttk.Combobox(
+            self, textvariable=self.size, values=("2", "10", "50", "100"),
+            state="readonly", width=12,
+        ).grid(row=4, column=1, sticky="w", pady=7)
+
+        self.identifier.trace_add("write", self._identifier_changed)
+        self.folder.trace_add("write", self._folder_changed)
         actions = ttk.Frame(self)
-        actions.grid(row=len(fields), column=0, columnspan=2, sticky="e", padx=12, pady=12)
+        actions.grid(row=5, column=0, columnspan=3, sticky="e", padx=12, pady=12)
         ttk.Button(actions, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(actions, text="Add channel", command=self.submit).pack(side="right")
         self.bind("<Return>", lambda _event: self.submit())
         self.wait_visibility()
-        self.focus_set()
+        self.identifier_entry.focus_set()
+
+    def _identifier_changed(self, *_args: Any) -> None:
+        if self.folder_edited:
+            return
+        self.setting_folder = True
+        self.folder.set(suggested_channel_folder(self.identifier.get()))
+        self.setting_folder = False
+
+    def _folder_changed(self, *_args: Any) -> None:
+        if not self.setting_folder:
+            self.folder_edited = True
+
+    def refresh_file_types(self) -> None:
+        identifier = self.identifier.get().strip()
+        if not identifier:
+            messagebox.showwarning("Missing channel", "Enter a Telegram channel first.", parent=self)
+            return
+        request_id = f"{id(self)}-{time.monotonic_ns()}"
+        self.inspect_request_id = request_id
+        self.file_types_text.set("Scanning channel…")
+        self.refresh_types_button.configure(state="disabled")
+        if not self.engine.command("inspect_channel_types", identifier=identifier, request_id=request_id):
+            self.refresh_types_button.configure(state="normal")
+            self.file_types_text.set("All file types")
+            messagebox.showwarning("Not connected", "The downloader is not connected yet.", parent=self)
+
+    def receive_file_types(self, data: dict[str, Any]) -> None:
+        if data.get("request_id") != self.inspect_request_id:
+            return
+        self.inspect_request_id = None
+        self.refresh_types_button.configure(state="normal")
+        if data.get("error"):
+            self.file_types_text.set("All file types" if not self.selected_file_types else ", ".join(self.selected_file_types))
+            messagebox.showwarning("File type scan failed", str(data["error"]), parent=self)
+            return
+        username = str(data.get("username", "")).strip()
+        if username and not self.folder_edited:
+            self.setting_folder = True
+            self.folder.set(username)
+            self.setting_folder = False
+        self.available_file_types = [
+            (str(item["extension"]), int(item["count"])) for item in data.get("file_types", [])
+        ]
+        if not self.available_file_types:
+            self.file_types_text.set("No downloadable file types found")
+            messagebox.showinfo("File types", "No downloadable files were found in this channel.", parent=self)
+            return
+        FileTypeDialog(
+            self, self.available_file_types, self.selected_file_types, self.apply_file_types,
+        )
+
+    def apply_file_types(self, selected: tuple[str, ...]) -> None:
+        self.selected_file_types = selected
+        self.file_types_text.set(", ".join(selected))
 
     def submit(self) -> None:
         identifier = self.identifier.get().strip()
@@ -149,10 +289,13 @@ class AddChannelDialog(tk.Toplevel):
         except ValueError:
             messagebox.showwarning("Invalid minimum", "Minimum length and size must be numbers.", parent=self)
             return
-        folder = self.folder.get().strip() or identifier.replace("https://t.me/", "").replace("@", "")
+        # Let the engine use Telegram's resolved username unless the user chose
+        # a custom folder (for example, by appending "_audio" or "_video").
+        folder = self.folder.get().strip() if self.folder_edited else ""
         self.engine.command(
             "add_channel", identifier=identifier, folder=folder,
             min_duration_seconds=duration, min_size_bytes=size,
+            media_types=self.selected_file_types,
         )
         self.destroy()
 
@@ -206,7 +349,7 @@ class SettingsDialog(tk.Toplevel):
         self.check_status_label = ttk.Label(frame, textvariable=self.check_status_text, wraplength=560)
         self.check_status_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 2))
         ttk.Label(
-            frame, text="Saved changes take effect after Reconnect or an application restart.",
+            frame, text="Saved changes take effect after an application restart.",
             foreground="#8a5a00",
         ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 4))
         actions = ttk.Frame(frame)
@@ -290,7 +433,7 @@ class SettingsDialog(tk.Toplevel):
         if changed:
             messagebox.showinfo(
                 "Connection settings saved",
-                "Proxy settings were saved. Click Reconnect to use them, or restart the application.",
+                "Proxy settings were saved. Restart the application to use them.",
                 parent=self.master,
             )
 
@@ -327,12 +470,13 @@ class MediaTable(ttk.Frame):
     def selected_ids(self) -> list[int]:
         return [int(item) for item in self.tree.selection()]
 
-    def populate(self, rows: list[Any], positions: dict[int, int]) -> None:
+    def populate(self, rows: list[Any], positions: dict[int, int], channel_paused: bool = False) -> None:
         signature = tuple(
             (
                 int(row["id"]), row["status"], int(row["bytes_downloaded"]), row["error"],
                 row["message_date"], row["downloaded_at"],
-                positions.get(int(row["id"])) if row["status"] == "queued" else None,
+                positions.get(int(row["id"])) if row["status"] == "queued" and not channel_paused else None,
+                channel_paused,
             )
             for row in rows
         )
@@ -346,11 +490,13 @@ class MediaTable(ttk.Frame):
             size = int(row["size_bytes"])
             done = int(row["bytes_downloaded"])
             duration = int(row["duration_seconds"])
-            if status == "queued":
+            if status == "queued" and channel_paused:
+                display_status = "Paused"
+            elif status == "queued":
                 display_status = f"Queued (position {positions.get(media_id, '?')})"
             elif status == "downloading":
                 percent = min(100, round(done * 100 / size)) if size else 0
-                display_status = f"Downloading ({percent}%)"
+                display_status = f"Paused ({percent}%)" if channel_paused else f"Downloading ({percent}%)"
             else:
                 display_status = status.capitalize()
             values = {
@@ -427,6 +573,14 @@ class ChannelPanel(ttk.LabelFrame):
             header, "collapse", "Collapse details", command=self.toggle_details,
         )
         self.collapse_button.pack(side="right")
+        self.channel_pause_button = IconButton(
+            header, "play" if channel.paused else "pause",
+            "Resume channel" if channel.paused else "Pause channel",
+            command=self.toggle_channel_pause,
+        )
+        self.channel_pause_button.pack(side="right", padx=(0, 6))
+        self.progress = BlueProgressBar(header)
+        self.progress.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
         self.details = ttk.Frame(self)
         self.details.pack(fill="both", expand=True)
@@ -437,8 +591,6 @@ class ChannelPanel(ttk.LabelFrame):
         ttk.Label(current_row, textvariable=self.progress_text, anchor="e").grid(
             row=0, column=1, sticky="e", padx=(12, 0),
         )
-        self.progress = BlueProgressBar(self.details)
-        self.progress.pack(fill="x", pady=(0, 5))
         ttk.Label(self.details, textvariable=self.stats).pack(fill="x", pady=(0, 7))
         self.notebook = ttk.Notebook(self.details)
         self.notebook.pack(fill="both", expand=True)
@@ -467,17 +619,19 @@ class ChannelPanel(ttk.LabelFrame):
             IconButton(
                 controls, "refresh", "Check for new files", command=self.rescan,
             ).pack(side="left")
-            ttk.Button(
-                controls, text="Remove channel", command=self.remove_channel,
+            IconButton(
+                controls, "remove", "Remove channel", command=self.remove_channel,
             ).pack(side="left", padx=(6, 0))
         label = tk.StringVar(value="Page 1 of 1")
         self.page_labels[kind] = label
-        ttk.Button(
-            controls, text="Next page", command=lambda selected=kind: self.change_page(selected, 1),
+        IconButton(
+            controls, "next", "Next page",
+            command=lambda selected=kind: self.change_page(selected, 1),
         ).pack(side="right")
         ttk.Label(controls, textvariable=label).pack(side="right", padx=8)
-        ttk.Button(
-            controls, text="Previous page", command=lambda selected=kind: self.change_page(selected, -1),
+        IconButton(
+            controls, "previous", "Previous page",
+            command=lambda selected=kind: self.change_page(selected, -1),
         ).pack(side="right")
 
     @staticmethod
@@ -507,11 +661,24 @@ class ChannelPanel(ttk.LabelFrame):
     def rescan(self) -> None:
         self.engine.command("rescan", channel_id=self.channel.id)
 
+    def toggle_channel_pause(self) -> None:
+        paused = not self.channel.paused
+        self.db.set_channel_paused(self.channel.id, paused)
+        self.channel = next(channel for channel in self.db.channels() if channel.id == self.channel.id)
+        self.engine.command("set_channel_paused", channel_id=self.channel.id, paused=paused)
+        self.channel_pause_button.set_icon(
+            "play" if paused else "pause",
+            "Resume channel" if paused else "Pause channel",
+        )
+        self.refresh(self.cached_positions)
+
     def remove_channel(self) -> None:
         if messagebox.askyesno(
             "Remove channel",
-            f"Stop all downloads from {self.channel.title} and remove it from the channel list?\n\n"
-            "Downloaded-message history will be preserved. Adding the channel again will restore it.",
+            f"Remove {self.channel.title} from the channel list?\n\n"
+            "Its database record, history, queue, and completed files will remain. "
+            "Any file currently downloading will be discarded and reset to 0%.\n\n"
+            "Adding the channel again will restore it.",
             parent=self,
         ):
             self.db.set_channel_enabled(self.channel.id, False)
@@ -545,6 +712,10 @@ class ChannelPanel(ttk.LabelFrame):
 
     def refresh(self, positions: dict[int, int]) -> None:
         self.cached_positions = positions
+        self.channel_pause_button.set_icon(
+            "play" if self.channel.paused else "pause",
+            "Resume channel" if self.channel.paused else "Pause channel",
+        )
         revision = self.db.revision
         if revision != self.count_revision:
             self.cached_counts = {
@@ -552,16 +723,20 @@ class ChannelPanel(ttk.LabelFrame):
             }
             self.count_revision = revision
         counts = self.cached_counts
+        title = f"{self.channel.title} (Paused)" if self.channel.paused else self.channel.title
         if self.collapsed:
             self.configure(
-                text=(f"{self.channel.title}    Queue: {counts['queue']}    "
+                text=(f"{title}    Queue: {counts['queue']}    "
                       f"Downloaded: {counts['downloaded']}    Failed: {counts['failed']}")
             )
         else:
-            self.configure(text=self.channel.title)
+            self.configure(text=title)
         minimum = f"{self.channel.min_duration_seconds // 60}:{self.channel.min_duration_seconds % 60:02d}"
+        file_types = ", ".join(self.channel.media_types) if self.channel.media_types else "All file types"
         self.stats.set(
-            f"Folder: {self.channel.folder}    Minimum: {minimum} / {format_bytes(self.channel.min_size_bytes)}"
+            f"Folder: {self.channel.folder}    "
+            f"File types: {file_types}    "
+            f"Minimum: {minimum} / {format_bytes(self.channel.min_size_bytes)}"
         )
         active = self.db.active_download(self.channel.id)
         if active:
@@ -571,12 +746,16 @@ class ChannelPanel(ttk.LabelFrame):
             speed = max(0, done - self.last_bytes) / max(0.001, now - self.last_time) if media_id == self.last_active_id else 0
             self.last_active_id, self.last_bytes, self.last_time = media_id, done, now
             percent = min(100, round(done * 100 / size)) if size else 0
-            self.current.set(f"Current file: {active['file_name']}")
+            prefix = "Current file (paused)" if self.channel.paused else "Current file"
+            self.current.set(f"{prefix}: {active['file_name']}")
             self.progress.set_value(percent)
-            self.progress_text.set(f"{percent}%    {format_bytes(done)} / {format_bytes(size)}    {format_bytes(round(speed))}/s")
+            if self.channel.paused:
+                self.progress_text.set(f"{percent}%    {format_bytes(done)} / {format_bytes(size)}    Paused")
+            else:
+                self.progress_text.set(f"{percent}%    {format_bytes(done)} / {format_bytes(size)}    {format_bytes(round(speed))}/s")
         else:
             self.last_active_id = None
-            self.current.set("Current file: Waiting for next file")
+            self.current.set("Current file: Channel paused" if self.channel.paused else "Current file: Waiting for next file")
             self.progress.set_value(0)
             self.progress_text.set("0%")
         for kind, count in counts.items():
@@ -597,7 +776,7 @@ class ChannelPanel(ttk.LabelFrame):
             rows = self.db.downloaded_media_for_channel(self.channel.id, page_size, offset)
         else:
             rows = self.db.failed_media_for_channel(self.channel.id, page_size, offset)
-        self.tables[kind].populate(rows, positions)
+        self.tables[kind].populate(rows, positions, self.channel.paused)
         self.page_labels[kind].set(f"Page {self.page_numbers[kind] + 1} of {page_count}")
         self.table_revisions[kind] = revision
 
@@ -653,13 +832,14 @@ class DownloaderApp(tk.Tk):
         self.config = config
         self.events: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
         self.cards: dict[int, ChannelPanel] = {}
+        self.add_channel_dialog: AddChannelDialog | None = None
         self.paused = False
         self.closing = False
         self.poll_job: str | None = None
         self.position_revision = -1
         self.cached_positions: dict[int, int] = {}
         self.engine = DownloaderEngine(config, db, lambda name, payload: self.events.put((name, payload)))
-        self.title("Channel Audio Downloader")
+        self.title("Channel Media Downloader")
         self.geometry("1280x820")
         self.minsize(900, 600)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -678,13 +858,8 @@ class DownloaderApp(tk.Tk):
         )
         self.pause_button.pack(side="left", padx=(6, 0))
         IconButton(
-            toolbar, "refresh", "Check all channels", command=self.refresh_all,
-        ).pack(side="left", padx=(6, 0))
-        IconButton(
             toolbar, "settings", "Settings", command=self.open_settings,
         ).pack(side="left", padx=(6, 0))
-        self.reconnect_button = ttk.Button(toolbar, text="Reconnect", command=self.reconnect, state="disabled")
-        self.reconnect_button.pack(side="left", padx=(6, 0))
         ttk.Label(toolbar, text="Speed limit:").pack(side="left", padx=(18, 5))
         self.speed = ttk.Combobox(
             toolbar, width=13, values=("Unlimited", "128 KB/s", "256 KB/s", "500 KB/s", "1024 KB/s", "2048 KB/s"),
@@ -731,22 +906,14 @@ class DownloaderApp(tk.Tk):
                 self.cards[channel.id].channel = channel
 
     def add_channel(self) -> None:
-        AddChannelDialog(self, self.engine)
+        if self.add_channel_dialog is not None and self.add_channel_dialog.winfo_exists():
+            self.add_channel_dialog.lift()
+            self.add_channel_dialog.focus_set()
+            return
+        self.add_channel_dialog = AddChannelDialog(self, self.engine)
 
     def open_settings(self) -> None:
         SettingsDialog(self, self.db, self.config)
-
-    def reconnect(self) -> None:
-        self.connection.set_status("Connecting…", "connecting")
-        self.error_message.set("")
-        self.reconnect_button.configure(state="disabled")
-        self.paused = False
-        self.pause_button.set_icon("pause", "Pause downloads")
-        self.engine.start()
-
-    def refresh_all(self) -> None:
-        for channel in self.db.channels(True):
-            self.engine.command("rescan", channel_id=channel.id)
 
     def apply_speed(self, _event: Any = None) -> None:
         value = self.speed.get().strip().lower()
@@ -763,8 +930,7 @@ class DownloaderApp(tk.Tk):
         target_paused = not self.paused
         changed = self.engine.pause() if target_paused else self.engine.resume()
         if not changed:
-            self.error_message.set("The downloader is not running. Change Settings if needed, then click Reconnect.")
-            self.reconnect_button.configure(state="normal")
+            self.error_message.set("The downloader is not running. Change Settings if needed, then restart the application.")
             return
         self.paused = target_paused
         if self.paused:
@@ -777,26 +943,27 @@ class DownloaderApp(tk.Tk):
             self.connection.set_status("Not connected", "disconnected")
             self.error_message.set(
                 f"Downloader stopped: {data.get('error', 'Unknown error')}  "
-                "Change Settings if needed, then click Reconnect."
+                "Change Settings if needed, then restart the application."
             )
-            self.reconnect_button.configure(state="normal")
         elif event == "error":
-            self.connection.set_status("Connection error", "disconnected")
             self.error_message.set(str(data.get("error", "")))
-        elif event == "state" and "connected" in data:
-            if data["connected"]:
+        elif event == "connection":
+            status = str(data.get("status", "disconnected"))
+            if status == "connected":
                 suffix = " through MTProto proxy" if data.get("mtproto_proxy") else ""
                 self.connection.set_status(f"Connected{suffix}", "connected")
-                self.error_message.set("")
-                self.reconnect_button.configure(state="disabled")
+            elif status == "connecting":
+                self.connection.set_status("Connecting…", "connecting")
             else:
                 self.connection.set_status("Disconnected", "disconnected")
-                if not self.closing:
-                    self.reconnect_button.configure(state="normal")
         elif event == "channel_added":
             self.sync_cards()
         elif event == "channel_removed":
             self.sync_cards()
+        elif event == "channel_types":
+            dialog = self.add_channel_dialog
+            if dialog is not None and dialog.winfo_exists():
+                dialog.receive_file_types(data)
 
     def poll(self) -> None:
         if self.closing:

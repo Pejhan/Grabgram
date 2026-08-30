@@ -4,6 +4,7 @@ import asyncio
 import mimetypes
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
@@ -25,8 +26,8 @@ EventCallback = Callable[[str, dict[str, Any]], None]
 
 
 @dataclass(frozen=True)
-class AudioInfo:
-    document_id: int
+class MediaInfo:
+    media_id: int
     filename: str
     size: int
     duration: int
@@ -79,11 +80,15 @@ class DownloaderEngine:
         self._running: asyncio.Event | None = None
         self._stopping = False
         self._client: Any = None
+        self._connection_status: str | None = None
+        self._mtproto_proxy_enabled = False
         self._active_download_task: asyncio.Task[None] | None = None
         self._active_media_id: int | None = None
         self._active_channel_id: int | None = None
         self._removed_channel_media_id: int | None = None
+        self._filtered_channel_media_id: int | None = None
         self._removed_channel_ids: set[int] = set()
+        self._paused_channel_ids = {channel.id for channel in db.channels(True) if channel.paused}
         self._limiter = BandwidthLimiter(db.setting_int("speed_limit_bytes_per_second", 0))
         self._avatar_dir = db.path.parent / "avatars"
         self._avatar_dir.mkdir(parents=True, exist_ok=True)
@@ -134,6 +139,16 @@ class DownloaderEngine:
     def _emit(self, event: str, **payload: Any) -> None:
         self.callback(event, payload)
 
+    def _set_connection_status(self, status: str) -> None:
+        """Publish transport health only when it actually changes."""
+        if status == self._connection_status:
+            return
+        self._connection_status = status
+        self._emit(
+            "connection", status=status,
+            mtproto_proxy=self._mtproto_proxy_enabled,
+        )
+
     def _thread_main(self) -> None:
         try:
             asyncio.run(self._main())
@@ -158,10 +173,12 @@ class DownloaderEngine:
         self._running = asyncio.Event()
         self._running.set()
         mtproxy = load_mtproto_proxy(self.db)
+        self._mtproto_proxy_enabled = mtproxy.enabled
         self._client = TelegramClient(
             str(self.config.session_file), self.config.api_id, self.config.api_hash,
             **telethon_client_options(mtproxy, connection),
         )
+        self._set_connection_status("connecting")
         await self._client.connect()
         if not await self._client.is_user_authorized():
             self._emit("fatal", error="Telegram session is not authorized. Close the app and run: python -m tg_downloader.auth")
@@ -169,7 +186,8 @@ class DownloaderEngine:
             return
 
         self._client.add_event_handler(self._on_new_message, events.NewMessage())
-        self._emit("state", connected=True, paused=False, mtproto_proxy=mtproxy.enabled)
+        self._set_connection_status("connected")
+        self._emit("state", paused=False)
 
         scans = [asyncio.create_task(self._scan_channel(channel, full=True)) for channel in self.db.channels(True)]
         avatars = [asyncio.create_task(self._cache_avatar(channel)) for channel in self.db.channels(True)]
@@ -177,6 +195,7 @@ class DownloaderEngine:
             asyncio.create_task(self._download_loop()),
             asyncio.create_task(self._command_loop()),
             asyncio.create_task(self._periodic_scan()),
+            asyncio.create_task(self._connection_monitor()),
         ]
         try:
             while not self._stopping:
@@ -186,7 +205,18 @@ class DownloaderEngine:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             await self._client.disconnect()
-            self._emit("state", connected=False)
+            self._set_connection_status("disconnected")
+
+    async def _connection_monitor(self) -> None:
+        """Reflect Telethon reconnects without confusing operation failures with transport health."""
+        while True:
+            await asyncio.sleep(1)
+            client = self._client
+            try:
+                connected = bool(client is not None and client.is_connected())
+            except Exception:
+                connected = False
+            self._set_connection_status("connected" if connected else "connecting")
 
     async def _command_loop(self) -> None:
         assert self._commands is not None
@@ -196,6 +226,8 @@ class DownloaderEngine:
                 self._stopping = True
             elif name == "add_channel":
                 await self._add_channel(**data)
+            elif name == "inspect_channel_types":
+                asyncio.create_task(self._inspect_channel_types(**data))
             elif name == "rescan":
                 channel = next((c for c in self.db.channels() if c.id == data["channel_id"]), None)
                 if channel:
@@ -205,32 +237,88 @@ class DownloaderEngine:
                 self._limiter.set_rate(bytes_per_second)
                 self.db.set_setting_int("speed_limit_bytes_per_second", bytes_per_second)
                 self._emit("state", speed_limit_bytes_per_second=bytes_per_second)
+            elif name == "set_channel_paused":
+                channel_id = int(data["channel_id"])
+                paused = bool(data["paused"])
+                self.db.set_channel_paused(channel_id, paused)
+                if paused:
+                    self._paused_channel_ids.add(channel_id)
+                else:
+                    self._paused_channel_ids.discard(channel_id)
+                self._emit("channel_pause_changed", channel_id=channel_id, paused=paused)
             elif name == "remove_channel":
                 channel_id = int(data["channel_id"])
                 self.db.set_channel_enabled(channel_id, False)
                 self._removed_channel_ids.add(channel_id)
+                self._paused_channel_ids.discard(channel_id)
                 task = self._active_download_task
                 if task is not None and not task.done() and self._active_channel_id == channel_id:
                     self._removed_channel_media_id = self._active_media_id
                     task.cancel()
                 self._emit("channel_removed", channel_id=channel_id)
 
+    async def _wait_until_channel_ready(self, channel_id: int) -> None:
+        """Wait for both the global and channel-specific download controls."""
+        assert self._running is not None
+        while True:
+            await self._running.wait()
+            if channel_id not in self._paused_channel_ids:
+                return
+            await asyncio.sleep(0.1)
+
     async def _add_channel(self, identifier: str, folder: str, min_duration_seconds: int,
-                           min_size_bytes: int) -> None:
+                           min_size_bytes: int, media_types: tuple[str, ...] = ()) -> None:
         try:
-            self._folder_path(folder)
             entity = await self._client.get_entity(identifier)
             title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
+            folder = folder.strip() or str(getattr(entity, "username", None) or entity.id)
+            self._folder_path(folder)
             channel_id = self.db.add_channel(
-                identifier, int(entity.id), title, folder, min_duration_seconds, min_size_bytes
+                identifier, int(entity.id), title, folder, min_duration_seconds, min_size_bytes,
+                media_types,
             )
+            task = self._active_download_task
+            active_media_id = self._active_media_id
+            if (
+                task is not None and not task.done()
+                and self._active_channel_id == channel_id
+                and active_media_id is not None
+                and not self.db.media_exists(active_media_id)
+            ):
+                self._filtered_channel_media_id = active_media_id
+                task.cancel()
             self._removed_channel_ids.discard(channel_id)
+            self._paused_channel_ids.discard(channel_id)
             channel = next(c for c in self.db.channels() if c.id == channel_id)
             self._emit("channel_added", channel_id=channel_id)
             asyncio.create_task(self._scan_channel(channel, full=True))
             asyncio.create_task(self._cache_avatar(channel))
         except Exception as exc:
             self._emit("error", error=f"Could not add {identifier}: {type(exc).__name__}: {exc}")
+
+    async def _inspect_channel_types(self, identifier: str, request_id: str) -> None:
+        try:
+            entity = await self._client.get_entity(identifier)
+            counts: Counter[str] = Counter()
+            async for message in self._client.iter_messages(entity):
+                info = self._media_info(message)
+                if info is not None:
+                    counts[Path(info.filename).suffix.lower() or ".file"] += 1
+                await asyncio.sleep(0)
+            file_types = [
+                {"extension": extension, "count": count}
+                for extension, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            ]
+            self._emit(
+                "channel_types", request_id=request_id,
+                username=str(getattr(entity, "username", None) or ""),
+                file_types=file_types,
+            )
+        except Exception as exc:
+            self._emit(
+                "channel_types", request_id=request_id, file_types=[],
+                error=f"Could not inspect channel: {type(exc).__name__}: {exc}",
+            )
 
     def _folder_path(self, folder: str) -> Path:
         root = self.config.download_root.resolve()
@@ -258,40 +346,59 @@ class DownloaderEngine:
             return
 
     @staticmethod
-    def _audio_info(message: Any) -> AudioInfo | None:
+    def _media_info(message: Any) -> MediaInfo | None:
         document = getattr(message, "document", None)
-        if document is None or not (getattr(document, "mime_type", "") or "").lower().startswith("audio/"):
+        photo = getattr(message, "photo", None)
+        media = document or photo
+        if media is None:
             return None
+        telegram_file = getattr(message, "file", None)
         duration = 0
-        filename = ""
+        filename = str(getattr(telegram_file, "name", "") or "")
         performer = ""
         title = ""
-        for attr in getattr(document, "attributes", []):
+        for attr in getattr(document, "attributes", []) if document is not None else []:
             cls = type(attr).__name__
             if cls == "DocumentAttributeAudio":
                 duration = int(getattr(attr, "duration", 0) or 0)
                 performer = getattr(attr, "performer", "") or ""
                 title = getattr(attr, "title", "") or ""
+            elif cls == "DocumentAttributeVideo":
+                duration = int(getattr(attr, "duration", 0) or 0)
             elif cls == "DocumentAttributeFilename":
                 filename = getattr(attr, "file_name", "") or ""
-        extension = mimetypes.guess_extension(document.mime_type or "") or ".audio"
+        mime_type = str(
+            getattr(telegram_file, "mime_type", "")
+            or getattr(document, "mime_type", "")
+            or ("image/jpeg" if photo is not None else "")
+        )
+        extension = str(getattr(telegram_file, "ext", "") or "")
+        if not extension.startswith("."):
+            extension = f".{extension}" if extension else ""
+        extension = extension.lower() or mimetypes.guess_extension(mime_type) or ".file"
         if not filename and (performer or title):
             filename = f"{performer} - {title}".strip(" -") + extension
-        return AudioInfo(
-            document_id=int(document.id), filename=safe_filename(filename, message.id, extension),
-            size=int(getattr(document, "size", 0) or 0), duration=duration,
+        return MediaInfo(
+            media_id=int(getattr(media, "id", 0) or 0),
+            filename=safe_filename(filename, message.id, extension),
+            size=int(
+                getattr(telegram_file, "size", 0)
+                or getattr(document, "size", 0)
+                or 0
+            ),
+            duration=duration,
         )
 
     async def _record_message(self, channel: Channel, message: Any, priority: int) -> bool:
         self.db.note_seen(channel.id, int(message.id))
-        info = self._audio_info(message)
+        info = self._media_info(message)
         if not info:
             return False
         date = message.date
         if date and date.tzinfo is None:
             date = date.replace(tzinfo=timezone.utc)
         added = self.db.add_media(
-            channel=channel, message_id=int(message.id), document_id=info.document_id,
+            channel=channel, message_id=int(message.id), document_id=info.media_id,
             file_name=info.filename, size_bytes=info.size, duration_seconds=info.duration,
             message_date=date.isoformat() if date else "", priority=priority,
         )
@@ -352,18 +459,23 @@ class DownloaderEngine:
                 self._active_media_id = None
                 self._active_channel_id = None
                 self._removed_channel_media_id = None
+                self._filtered_channel_media_id = None
 
     async def _download_one(self, row: Any) -> None:
         media_id = int(row["id"])
+        channel_id = int(row["channel_id"])
+        partial: Path | None = None
         self._emit("download_started", media_id=media_id, channel_id=row["channel_id"])
         try:
             folder = self._folder_path(row["folder"])
             folder.mkdir(parents=True, exist_ok=True)
             output = unique_output_path(folder, row["file_name"], int(row["message_id"]))
             partial = Path(f"{output}.part")
+            await self._wait_until_channel_ready(channel_id)
             message = await self._client.get_messages(row["identifier"], ids=int(row["message_id"]))
-            if not message or not message.document:
-                raise RuntimeError("Telegram message or audio document is no longer available")
+            downloadable = getattr(message, "document", None) or getattr(message, "photo", None)
+            if not message or downloadable is None:
+                raise RuntimeError("Telegram message or media is no longer available")
             expected = int(row["size_bytes"])
             offset = partial.stat().st_size if partial.exists() else 0
             if offset > expected:
@@ -382,12 +494,11 @@ class DownloaderEngine:
             chunk_size = self._limiter.preferred_chunk_size()
             with partial.open("ab") as handle:
                 async for chunk in self._client.iter_download(
-                    message.document, offset=offset, chunk_size=chunk_size
+                    downloadable, offset=offset, chunk_size=chunk_size
                 ):
-                    assert self._running is not None
-                    await self._running.wait()
+                    await self._wait_until_channel_ready(channel_id)
                     await self._limiter.wait_for(len(chunk))
-                    await self._running.wait()
+                    await self._wait_until_channel_ready(channel_id)
                     handle.write(chunk)
                     offset += len(chunk)
                     now = time.monotonic()
@@ -408,10 +519,27 @@ class DownloaderEngine:
             self._emit("download_finished", media_id=media_id, channel_id=row["channel_id"])
         except asyncio.CancelledError:
             if self._removed_channel_media_id == media_id:
-                self.db.requeue(media_id)
+                self._discard_partial(partial)
+                self.db.reset_active_download(media_id)
+                return
+            if self._filtered_channel_media_id == media_id:
+                self._discard_partial(partial)
                 return
             self.db.requeue(media_id)
             raise
         except Exception as exc:
             self.db.mark_failed(media_id, f"{type(exc).__name__}: {exc}")
             self._emit("error", error=f"Download failed: {row['file_name']}: {exc}")
+
+    def _discard_partial(self, partial: Path | None) -> None:
+        if partial is None:
+            return
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            # A zero-byte fallback still prevents a future resume if Windows
+            # temporarily refuses to remove the closed partial file.
+            try:
+                partial.write_bytes(b"")
+            except OSError as exc:
+                self._emit("error", error=f"Could not discard partial file: {exc}")

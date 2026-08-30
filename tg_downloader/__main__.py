@@ -15,7 +15,7 @@ except ImportError:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Channel Audio Downloader desktop application")
+    parser = argparse.ArgumentParser(description="Channel Media Downloader desktop application")
     parser.add_argument("--config", type=Path, default=Path("config.json"))
     args = parser.parse_args()
     if __package__:

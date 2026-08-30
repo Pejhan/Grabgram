@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS channels (
     min_duration_seconds INTEGER NOT NULL DEFAULT 0,
     min_size_bytes INTEGER NOT NULL DEFAULT 0,
     enabled INTEGER NOT NULL DEFAULT 1,
+    paused INTEGER NOT NULL DEFAULT 0,
+    media_types TEXT NOT NULL DEFAULT '',
     scan_complete INTEGER NOT NULL DEFAULT 0,
     last_seen_message_id INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -65,6 +67,8 @@ class Channel:
     min_duration_seconds: int
     min_size_bytes: int
     enabled: bool
+    paused: bool
+    media_types: tuple[str, ...]
     scan_complete: bool
     last_seen_message_id: int
 
@@ -106,6 +110,10 @@ class Database:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(channels)")}
             if "last_seen_message_id" not in columns:
                 conn.execute("ALTER TABLE channels ADD COLUMN last_seen_message_id INTEGER NOT NULL DEFAULT 0")
+            if "paused" not in columns:
+                conn.execute("ALTER TABLE channels ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+            if "media_types" not in columns:
+                conn.execute("ALTER TABLE channels ADD COLUMN media_types TEXT NOT NULL DEFAULT ''")
             # An interrupted process resumes its current file and retries failures.
             conn.execute("UPDATE media SET status='queued' WHERE status='downloading'")
 
@@ -115,7 +123,9 @@ class Database:
             id=row["id"], telegram_id=row["telegram_id"], identifier=row["identifier"],
             title=row["title"], folder=row["folder"],
             min_duration_seconds=row["min_duration_seconds"], min_size_bytes=row["min_size_bytes"],
-            enabled=bool(row["enabled"]), scan_complete=bool(row["scan_complete"]),
+            enabled=bool(row["enabled"]), paused=bool(row["paused"]),
+            media_types=tuple(filter(None, str(row["media_types"]).split(","))),
+            scan_complete=bool(row["scan_complete"]),
             last_seen_message_id=int(row["last_seen_message_id"]),
         )
 
@@ -130,7 +140,13 @@ class Database:
             return self._channel(row) if row else None
 
     def add_channel(self, identifier: str, telegram_id: int, title: str, folder: str,
-                    min_duration_seconds: int, min_size_bytes: int) -> int:
+                    min_duration_seconds: int, min_size_bytes: int,
+                    media_types: tuple[str, ...] = ()) -> int:
+        normalized_types = tuple(sorted({
+            extension if extension.startswith(".") else f".{extension}"
+            for extension in (item.strip().lower() for item in media_types) if extension
+        }))
+        serialized_types = ",".join(normalized_types)
         with self.connect() as conn:
             existing = conn.execute(
                 "SELECT id FROM channels WHERE identifier=? OR telegram_id=? LIMIT 1",
@@ -140,17 +156,37 @@ class Database:
                 channel_id = int(existing["id"])
                 conn.execute(
                     """UPDATE channels SET identifier=?, telegram_id=?, title=?, folder=?,
-                       min_duration_seconds=?, min_size_bytes=?, enabled=1, scan_complete=0
+                       min_duration_seconds=?, min_size_bytes=?, media_types=?,
+                       enabled=1, paused=0, scan_complete=0
                        WHERE id=?""",
                     (identifier, telegram_id, title, folder, min_duration_seconds,
-                     min_size_bytes, channel_id),
+                     min_size_bytes, serialized_types, channel_id),
                 )
+                conn.execute(
+                    """DELETE FROM media WHERE channel_id=?
+                       AND status<>'downloaded'
+                       AND ((duration_seconds > 0 AND duration_seconds < ?) OR size_bytes < ?)""",
+                    (channel_id, min_duration_seconds, min_size_bytes),
+                )
+                if normalized_types:
+                    rows = conn.execute(
+                        """SELECT id, file_name FROM media
+                           WHERE channel_id=? AND status<>'downloaded'""", (channel_id,)
+                    ).fetchall()
+                    discard_ids = [
+                        int(row["id"]) for row in rows
+                        if Path(str(row["file_name"])).suffix.lower() not in normalized_types
+                    ]
+                    if discard_ids:
+                        marks = ",".join("?" for _ in discard_ids)
+                        conn.execute(f"DELETE FROM media WHERE id IN ({marks})", discard_ids)
                 self._bump_revision()
                 return channel_id
             cur = conn.execute(
                 """INSERT INTO channels(identifier, telegram_id, title, folder,
-                   min_duration_seconds, min_size_bytes) VALUES(?,?,?,?,?,?)""",
-                (identifier, telegram_id, title, folder, min_duration_seconds, min_size_bytes),
+                   min_duration_seconds, min_size_bytes, media_types) VALUES(?,?,?,?,?,?,?)""",
+                (identifier, telegram_id, title, folder, min_duration_seconds,
+                 min_size_bytes, serialized_types),
             )
             channel_id = int(cur.lastrowid)
         self._bump_revision()
@@ -160,6 +196,15 @@ class Database:
         with self.connect() as conn:
             conn.execute("UPDATE channels SET enabled=? WHERE id=?", (int(enabled), channel_id))
         self._bump_revision()
+
+    def set_channel_paused(self, channel_id: int, paused: bool) -> None:
+        with self.connect() as conn:
+            changed = conn.execute(
+                "UPDATE channels SET paused=? WHERE id=? AND enabled=1",
+                (int(paused), channel_id),
+            ).rowcount
+        if changed:
+            self._bump_revision()
 
     def set_scan_complete(self, channel_id: int, complete: bool = True) -> None:
         with self.connect() as conn:
@@ -175,7 +220,10 @@ class Database:
     def add_media(self, *, channel: Channel, message_id: int, document_id: int | None,
                   file_name: str, size_bytes: int, duration_seconds: int,
                   message_date: str, priority: int) -> bool:
-        if duration_seconds < channel.min_duration_seconds or size_bytes < channel.min_size_bytes:
+        if ((duration_seconds > 0 and duration_seconds < channel.min_duration_seconds)
+                or size_bytes < channel.min_size_bytes):
+            return False
+        if channel.media_types and Path(file_name).suffix.lower() not in channel.media_types:
             return False
         with self.connect() as conn:
             cur = conn.execute(
@@ -202,7 +250,7 @@ class Database:
             return conn.execute(
                 """SELECT m.*, c.identifier, c.folder, c.title AS channel_title
                    FROM media m JOIN channels c ON c.id=m.channel_id
-                   WHERE m.status='queued' AND c.enabled=1
+                   WHERE m.status='queued' AND c.enabled=1 AND c.paused=0
                    ORDER BY m.priority ASC, m.message_date DESC, m.id DESC LIMIT 1"""
             ).fetchone()
 
@@ -213,7 +261,7 @@ class Database:
             row = conn.execute(
                 """SELECT m.*, c.identifier, c.folder, c.title AS channel_title
                    FROM media m JOIN channels c ON c.id=m.channel_id
-                   WHERE m.status='queued' AND c.enabled=1
+                   WHERE m.status='queued' AND c.enabled=1 AND c.paused=0
                      AND NOT EXISTS (SELECT 1 FROM media WHERE status='downloading')
                    ORDER BY m.priority ASC, m.message_date DESC, m.id DESC LIMIT 1"""
             ).fetchone()
@@ -249,6 +297,17 @@ class Database:
         with self.connect() as conn:
             conn.execute("UPDATE media SET status='queued' WHERE id=? AND status='downloading'", (media_id,))
         self._bump_revision()
+
+    def reset_active_download(self, media_id: int) -> None:
+        """Requeue an active item with no retained partial-download state."""
+        with self.connect() as conn:
+            changed = conn.execute(
+                """UPDATE media SET status='queued', bytes_downloaded=0, output_path=NULL,
+                   downloaded_at=NULL, error=NULL WHERE id=? AND status='downloading'""",
+                (media_id,),
+            ).rowcount
+        if changed:
+            self._bump_revision()
 
     def requeue_interrupted_downloads(self) -> None:
         """Make work claimed by a stopped engine available to a replacement worker."""
@@ -350,6 +409,10 @@ class Database:
                 "SELECT * FROM media WHERE channel_id=? AND status='downloading' LIMIT 1", (channel_id,)
             ).fetchone()
 
+    def media_exists(self, media_id: int) -> bool:
+        with self.connect() as conn:
+            return conn.execute("SELECT 1 FROM media WHERE id=?", (media_id,)).fetchone() is not None
+
     def setting_int(self, key: str, default: int = 0) -> int:
         with self.connect() as conn:
             row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -381,7 +444,7 @@ class Database:
         with self.connect() as conn:
             rows = conn.execute(
                 """SELECT m.id FROM media m JOIN channels c ON c.id=m.channel_id
-                   WHERE m.status='queued' AND c.enabled=1
+                   WHERE m.status='queued' AND c.enabled=1 AND c.paused=0
                    ORDER BY m.priority ASC, m.message_date DESC, m.id DESC"""
             ).fetchall()
         return {int(row["id"]): position for position, row in enumerate(rows, 1)}
