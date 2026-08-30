@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 from typing import Any
 
@@ -484,6 +485,48 @@ class ChannelPanel(ttk.LabelFrame):
         self.table_revisions[kind] = revision
 
 
+class ConnectionPill(tk.Canvas):
+    """Compact connection indicator with a health dot and rounded background."""
+
+    COLORS = {
+        "connected": ("#e6f4ea", "#137333"),
+        "connecting": ("#eef1f4", "#5f6368"),
+        "disconnected": ("#fce8e6", "#b3261e"),
+    }
+
+    def __init__(self, parent: tk.Misc):
+        self.status_font = tkfont.Font(parent, family="Segoe UI", size=9, weight="bold")
+        background = parent.winfo_toplevel().cget("background")
+        super().__init__(
+            parent, height=28, width=100, background=background,
+            highlightthickness=0, borderwidth=0,
+        )
+        self.set_status("Connecting…", "connecting")
+
+    def set_status(self, text: str, state: str) -> None:
+        background, foreground = self.COLORS[state]
+        label = f"●  {text}"
+        width = self.status_font.measure(label) + 22
+        height = 28
+        radius = height // 2
+        self.configure(width=width, height=height)
+        self.delete("all")
+        self.create_oval(1, 1, height - 1, height - 1, fill=background, outline="")
+        self.create_oval(width - height + 1, 1, width - 1, height - 1, fill=background, outline="")
+        self.create_rectangle(radius, 1, width - radius, height - 1, fill=background, outline="")
+        self.create_arc(
+            1, 1, height - 1, height - 1, start=90, extent=180,
+            style="arc", outline=foreground, width=1,
+        )
+        self.create_arc(
+            width - height + 1, 1, width - 1, height - 1, start=-90, extent=180,
+            style="arc", outline=foreground, width=1,
+        )
+        self.create_line(radius, 1, width - radius, 1, fill=foreground, width=1)
+        self.create_line(radius, height - 1, width - radius, height - 1, fill=foreground, width=1)
+        self.create_text(width / 2, height / 2, text=label, fill=foreground, font=self.status_font)
+
+
 class DownloaderApp(tk.Tk):
     def __init__(self, config: Config, db: Database):
         super().__init__()
@@ -526,7 +569,7 @@ class DownloaderApp(tk.Tk):
         self.speed.pack(side="left")
         self.speed.bind("<<ComboboxSelected>>", self.apply_speed)
         self.speed.bind("<Return>", self.apply_speed)
-        self.connection = ttk.Label(toolbar, text="Connecting…")
+        self.connection = ConnectionPill(toolbar)
         self.connection.pack(side="right")
         self.error_message = tk.StringVar()
         self.error_banner = ttk.Label(
@@ -569,7 +612,7 @@ class DownloaderApp(tk.Tk):
         SettingsDialog(self, self.db, self.config)
 
     def reconnect(self) -> None:
-        self.connection.configure(text="Connecting…")
+        self.connection.set_status("Connecting…", "connecting")
         self.error_message.set("")
         self.reconnect_button.configure(state="disabled")
         self.paused = False
@@ -606,23 +649,23 @@ class DownloaderApp(tk.Tk):
 
     def handle_event(self, event: str, data: dict[str, Any]) -> None:
         if event == "fatal":
-            self.connection.configure(text="Not connected")
+            self.connection.set_status("Not connected", "disconnected")
             self.error_message.set(
                 f"Downloader stopped: {data.get('error', 'Unknown error')}  "
                 "Change Settings if needed, then click Reconnect."
             )
             self.reconnect_button.configure(state="normal")
         elif event == "error":
-            self.connection.configure(text=f"Error: {data.get('error', '')}")
+            self.connection.set_status("Connection error", "disconnected")
             self.error_message.set(str(data.get("error", "")))
         elif event == "state" and "connected" in data:
             if data["connected"]:
                 suffix = " through MTProto proxy" if data.get("mtproto_proxy") else ""
-                self.connection.configure(text=f"Connected{suffix}")
+                self.connection.set_status(f"Connected{suffix}", "connected")
                 self.error_message.set("")
                 self.reconnect_button.configure(state="disabled")
             else:
-                self.connection.configure(text="Disconnected")
+                self.connection.set_status("Disconnected", "disconnected")
                 if not self.closing:
                     self.reconnect_button.configure(state="normal")
         elif event == "channel_added":
