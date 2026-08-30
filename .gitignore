@@ -1,6 +1,6 @@
 # Local credentials and environment overrides
 config.json
-README.md
+*.md
 .env
 .env.*
 !.env.example
