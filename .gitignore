@@ -1,0 +1,42 @@
+# Local credentials and environment overrides
+config.json
+README.md
+.env
+.env.*
+!.env.example
+
+# Telegram authorization sessions and local application state
+data/
+downloads/
+*.session
+*.session-*
+*.session-journal
+*.session-shm
+*.session-wal
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.part
+
+# Python and tooling output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local logs and editor/OS metadata
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
