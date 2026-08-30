@@ -1,0 +1,8 @@
+{
+  "api_id": 0,
+  "api_hash": "replace-with-your-own-api-hash",
+  "session_file": "data/telegram",
+  "database_file": "data/downloader.sqlite3",
+  "download_root": "downloads",
+  "scan_interval_seconds": 60
+}
