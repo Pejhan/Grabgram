@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="telegram-blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#42b7ea"/>
+      <stop offset="1" stop-color="#1688c2"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="58" fill="url(#telegram-blue)"/>
+  <path fill="#fff" d="M39 91.5 207.2 34c8.9-3 17.3 5.1 14.6 14.1l-49.5 164.5c-2.7 9-14.4 11.4-20.5 4.2l-42.2-50-25.2 24.7c-5.2 5.1-14 1.4-14-5.9v-52.2L35.6 103c-4-3.5-2.1-9.8 3.4-11.5Zm48.2 36.4v35.6l17.9-17.5 61.6-64.4-79.5 46.3Z"/>
+  <circle cx="190" cy="190" r="53" fill="#126d9a" stroke="#fff" stroke-width="8"/>
+  <path fill="#fff" d="M181 157h18v42.2l14.6-14.6 12.8 12.8-30.1 30.1a9 9 0 0 1-12.7 0l-30.1-30.1 12.8-12.8 14.7 14.7V157Z"/>
+</svg>

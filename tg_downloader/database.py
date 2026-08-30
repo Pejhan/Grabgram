@@ -8,6 +8,29 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
+PRIORITY_LEVELS = {"high": 0, "medium": 1, "low": 2}
+PRIORITY_NAMES = ("high", "medium", "low")
+
+
+def priority_level(priority: str | int) -> int:
+    if isinstance(priority, str):
+        try:
+            return PRIORITY_LEVELS[priority.strip().lower()]
+        except KeyError as exc:
+            raise ValueError(f"Unknown priority: {priority}") from exc
+    value = int(priority)
+    if value not in range(len(PRIORITY_NAMES)):
+        raise ValueError(f"Unknown priority level: {priority}")
+    return value
+
+
+def priority_name(level: int) -> str:
+    try:
+        return PRIORITY_NAMES[int(level)]
+    except (IndexError, TypeError, ValueError) as exc:
+        raise ValueError(f"Unknown priority level: {level}") from exc
+
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -23,6 +46,8 @@ CREATE TABLE IF NOT EXISTS channels (
     enabled INTEGER NOT NULL DEFAULT 1,
     paused INTEGER NOT NULL DEFAULT 0,
     media_types TEXT NOT NULL DEFAULT '',
+    priority_level INTEGER NOT NULL DEFAULT 1,
+    priority_rank INTEGER NOT NULL DEFAULT 0,
     scan_complete INTEGER NOT NULL DEFAULT 0,
     last_seen_message_id INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -39,6 +64,8 @@ CREATE TABLE IF NOT EXISTS media (
     message_date TEXT,
     status TEXT NOT NULL DEFAULT 'queued',
     priority INTEGER NOT NULL DEFAULT 10,
+    priority_level INTEGER NOT NULL DEFAULT 1,
+    priority_rank INTEGER NOT NULL DEFAULT 0,
     bytes_downloaded INTEGER NOT NULL DEFAULT 0,
     output_path TEXT,
     error TEXT,
@@ -69,6 +96,8 @@ class Channel:
     enabled: bool
     paused: bool
     media_types: tuple[str, ...]
+    priority_level: int
+    priority_rank: int
     scan_complete: bool
     last_seen_message_id: int
 
@@ -114,6 +143,21 @@ class Database:
                 conn.execute("ALTER TABLE channels ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
             if "media_types" not in columns:
                 conn.execute("ALTER TABLE channels ADD COLUMN media_types TEXT NOT NULL DEFAULT ''")
+            if "priority_level" not in columns:
+                conn.execute("ALTER TABLE channels ADD COLUMN priority_level INTEGER NOT NULL DEFAULT 1")
+            if "priority_rank" not in columns:
+                conn.execute("ALTER TABLE channels ADD COLUMN priority_rank INTEGER NOT NULL DEFAULT 0")
+                conn.execute("UPDATE channels SET priority_rank=id")
+            media_columns = {row["name"] for row in conn.execute("PRAGMA table_info(media)")}
+            if "priority_level" not in media_columns:
+                conn.execute("ALTER TABLE media ADD COLUMN priority_level INTEGER NOT NULL DEFAULT 1")
+            if "priority_rank" not in media_columns:
+                conn.execute("ALTER TABLE media ADD COLUMN priority_rank INTEGER NOT NULL DEFAULT 0")
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS media_user_priority_idx
+                   ON media(status, priority_level, priority_rank, priority,
+                            message_date DESC, id DESC)"""
+            )
             # An interrupted process resumes its current file and retries failures.
             conn.execute("UPDATE media SET status='queued' WHERE status='downloading'")
 
@@ -125,12 +169,17 @@ class Database:
             min_duration_seconds=row["min_duration_seconds"], min_size_bytes=row["min_size_bytes"],
             enabled=bool(row["enabled"]), paused=bool(row["paused"]),
             media_types=tuple(filter(None, str(row["media_types"]).split(","))),
+            priority_level=int(row["priority_level"]), priority_rank=int(row["priority_rank"]),
             scan_complete=bool(row["scan_complete"]),
             last_seen_message_id=int(row["last_seen_message_id"]),
         )
 
     def channels(self, enabled_only: bool = False) -> list[Channel]:
-        sql = "SELECT * FROM channels" + (" WHERE enabled=1" if enabled_only else "") + " ORDER BY title"
+        sql = (
+            "SELECT * FROM channels"
+            + (" WHERE enabled=1" if enabled_only else "")
+            + " ORDER BY priority_level, priority_rank, id"
+        )
         with self.connect() as conn:
             return [self._channel(row) for row in conn.execute(sql)]
 
@@ -182,11 +231,15 @@ class Database:
                         conn.execute(f"DELETE FROM media WHERE id IN ({marks})", discard_ids)
                 self._bump_revision()
                 return channel_id
+            next_rank = int(conn.execute(
+                "SELECT COALESCE(MAX(priority_rank), 0) + 1 rank FROM channels WHERE priority_level=1"
+            ).fetchone()["rank"])
             cur = conn.execute(
                 """INSERT INTO channels(identifier, telegram_id, title, folder,
-                   min_duration_seconds, min_size_bytes, media_types) VALUES(?,?,?,?,?,?,?)""",
+                   min_duration_seconds, min_size_bytes, media_types,
+                   priority_level, priority_rank) VALUES(?,?,?,?,?,?,?,?,?)""",
                 (identifier, telegram_id, title, folder, min_duration_seconds,
-                 min_size_bytes, serialized_types),
+                 min_size_bytes, serialized_types, PRIORITY_LEVELS["medium"], next_rank),
             )
             channel_id = int(cur.lastrowid)
         self._bump_revision()
@@ -205,6 +258,76 @@ class Database:
             ).rowcount
         if changed:
             self._bump_revision()
+
+    def set_channel_priority(self, channel_id: int, priority: str | int) -> None:
+        level = priority_level(priority)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT priority_level FROM channels WHERE id=?", (channel_id,)
+            ).fetchone()
+            if row is None:
+                return
+            rank = int(conn.execute(
+                """SELECT COALESCE(MIN(priority_rank), 0) - 1 rank
+                   FROM channels WHERE priority_level=?""", (level,)
+            ).fetchone()["rank"])
+            changed = conn.execute(
+                "UPDATE channels SET priority_level=?, priority_rank=? WHERE id=?",
+                (level, rank, channel_id),
+            ).rowcount
+        if changed:
+            self._bump_revision()
+
+    def shift_channel_priority(self, channel_id: int, amount: int) -> None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT priority_level FROM channels WHERE id=?", (channel_id,)
+            ).fetchone()
+        if row is None:
+            return
+        current = int(row["priority_level"])
+        target = min(len(PRIORITY_NAMES) - 1, max(0, current + int(amount)))
+        if target != current:
+            self.set_channel_priority(channel_id, target)
+
+    def set_media_priority(self, media_ids: list[int], priority: str | int) -> None:
+        if not media_ids:
+            return
+        level = priority_level(priority)
+        with self.connect() as conn:
+            first_rank = int(conn.execute(
+                """SELECT COALESCE(MIN(priority_rank), 0) - ? rank
+                   FROM media WHERE priority_level=?""", (len(media_ids), level)
+            ).fetchone()["rank"])
+            changed = 0
+            for offset, media_id in enumerate(media_ids):
+                changed += conn.execute(
+                    "UPDATE media SET priority_level=?, priority_rank=? WHERE id=?",
+                    (level, first_rank + offset, int(media_id)),
+                ).rowcount
+        if changed:
+            self._bump_revision()
+
+    def shift_media_priority(self, media_ids: list[int], amount: int) -> None:
+        if not media_ids:
+            return
+        marks = ",".join("?" for _ in media_ids)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT id, priority_level FROM media WHERE id IN ({marks})",
+                [int(media_id) for media_id in media_ids],
+            ).fetchall()
+        current_levels = {int(row["id"]): int(row["priority_level"]) for row in rows}
+        grouped: dict[int, list[int]] = {}
+        for media_id in media_ids:
+            current = current_levels.get(int(media_id))
+            if current is None:
+                continue
+            target = min(len(PRIORITY_NAMES) - 1, max(0, current + int(amount)))
+            if target != current:
+                grouped.setdefault(target, []).append(int(media_id))
+        for target, ids in grouped.items():
+            self.set_media_priority(ids, target)
 
     def set_scan_complete(self, channel_id: int, complete: bool = True) -> None:
         with self.connect() as conn:
@@ -251,7 +374,9 @@ class Database:
                 """SELECT m.*, c.identifier, c.folder, c.title AS channel_title
                    FROM media m JOIN channels c ON c.id=m.channel_id
                    WHERE m.status='queued' AND c.enabled=1 AND c.paused=0
-                   ORDER BY m.priority ASC, m.message_date DESC, m.id DESC LIMIT 1"""
+                   ORDER BY c.priority_level, c.priority_rank, c.id,
+                            m.priority_level, m.priority_rank, m.priority,
+                            m.message_date DESC, m.id DESC LIMIT 1"""
             ).fetchone()
 
     def claim_next_queued(self) -> sqlite3.Row | None:
@@ -263,7 +388,9 @@ class Database:
                    FROM media m JOIN channels c ON c.id=m.channel_id
                    WHERE m.status='queued' AND c.enabled=1 AND c.paused=0
                      AND NOT EXISTS (SELECT 1 FROM media WHERE status='downloading')
-                   ORDER BY m.priority ASC, m.message_date DESC, m.id DESC LIMIT 1"""
+                   ORDER BY c.priority_level, c.priority_rank, c.id,
+                            m.priority_level, m.priority_rank, m.priority,
+                            m.message_date DESC, m.id DESC LIMIT 1"""
             ).fetchone()
             if row is not None:
                 conn.execute("UPDATE media SET status='downloading', error=NULL WHERE id=?", (row["id"],))
@@ -335,7 +462,8 @@ class Database:
                 """SELECT * FROM media WHERE channel_id=?
                    ORDER BY CASE status WHEN 'downloading' THEN 0 WHEN 'queued' THEN 1
                      WHEN 'failed' THEN 2 ELSE 3 END,
-                   priority ASC, message_date DESC, id DESC LIMIT ?""", (channel_id, limit)
+                   priority_level, priority_rank, priority,
+                   message_date DESC, id DESC LIMIT ?""", (channel_id, limit)
             ))
 
     def pending_media_for_channel(self, channel_id: int, limit: int = 500, offset: int = 0) -> list[sqlite3.Row]:
@@ -343,7 +471,8 @@ class Database:
             return list(conn.execute(
                 """SELECT * FROM media WHERE channel_id=? AND status!='downloaded'
                    ORDER BY CASE status WHEN 'downloading' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
-                   priority ASC, message_date DESC, id DESC LIMIT ? OFFSET ?""",
+                   priority_level, priority_rank, priority,
+                   message_date DESC, id DESC LIMIT ? OFFSET ?""",
                 (channel_id, limit, offset),
             ))
 
@@ -351,9 +480,10 @@ class Database:
                                  offset: int = 0) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return list(conn.execute(
-                """SELECT * FROM media WHERE channel_id=? AND status IN ('queued','downloading')
+                   """SELECT * FROM media WHERE channel_id=? AND status IN ('queued','downloading')
                    ORDER BY CASE status WHEN 'downloading' THEN 0 ELSE 1 END,
-                   priority ASC, message_date DESC, id DESC LIMIT ? OFFSET ?""",
+                   priority_level, priority_rank, priority,
+                   message_date DESC, id DESC LIMIT ? OFFSET ?""",
                 (channel_id, limit, offset),
             ))
 
@@ -445,7 +575,9 @@ class Database:
             rows = conn.execute(
                 """SELECT m.id FROM media m JOIN channels c ON c.id=m.channel_id
                    WHERE m.status='queued' AND c.enabled=1 AND c.paused=0
-                   ORDER BY m.priority ASC, m.message_date DESC, m.id DESC"""
+                   ORDER BY c.priority_level, c.priority_rank, c.id,
+                            m.priority_level, m.priority_rank, m.priority,
+                            m.message_date DESC, m.id DESC"""
             ).fetchall()
         return {int(row["id"]): position for position, row in enumerate(rows, 1)}
 

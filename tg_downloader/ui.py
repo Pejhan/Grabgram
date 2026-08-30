@@ -14,7 +14,7 @@ from typing import Any
 
 try:
     from .config import Config
-    from .database import Channel, Database
+    from .database import Channel, Database, priority_name
     from .engine import DownloaderEngine
     from .media import format_bytes
     from .proxy import (
@@ -24,7 +24,7 @@ try:
     from .proxy_check import check_mtproto_proxy, sanitized_proxy_error
 except ImportError:
     from config import Config
-    from database import Channel, Database
+    from database import Channel, Database, priority_name
     from engine import DownloaderEngine
     from media import format_bytes
     from proxy import (
@@ -37,8 +37,10 @@ except ImportError:
 ICON_NAMES = (
     "add", "collapse", "expand", "failed", "pause",
     "play", "queue", "refresh", "settings", "success",
-    "previous", "next", "remove",
+    "previous", "next", "remove", "priority-up", "priority-down",
 )
+
+PRIORITY_COLORS = {"high": "#34a853", "medium": None, "low": "#d93025"}
 
 
 def load_icons(master: tk.Misc) -> dict[str, tk.PhotoImage]:
@@ -49,7 +51,41 @@ def load_icons(master: tk.Misc) -> dict[str, tk.PhotoImage]:
             icons[name] = tk.PhotoImage(master=master, file=str(icon_directory / f"{name}.png"))
         except tk.TclError:
             pass
+    for priority, color in PRIORITY_COLORS.items():
+        if color is None:
+            continue
+        marker = tk.PhotoImage(master=master, width=5, height=16)
+        marker.put(color, to=(0, 0, 5, 16))
+        icons[f"{priority}-priority-marker"] = marker
     return icons
+
+
+def set_windows_app_identity() -> None:
+    """Give Windows a stable taskbar identity instead of grouping under Python."""
+    try:
+        import ctypes
+        import sys
+
+        if sys.platform == "win32":
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "TelegramDownloader.ChannelMediaDownloader"
+            )
+    except (AttributeError, OSError):
+        # Other platforms and restricted Windows environments can use Tk's icon alone.
+        pass
+
+
+def apply_application_icon(window: tk.Tk) -> list[tk.PhotoImage]:
+    icon_directory = Path(__file__).resolve().parent.parent / "assets" / "png"
+    images: list[tk.PhotoImage] = []
+    for name in ("app-icon-256.png", "app-icon-32.png"):
+        try:
+            images.append(tk.PhotoImage(master=window, file=str(icon_directory / name)))
+        except tk.TclError:
+            continue
+    if images:
+        window.iconphoto(True, *images)
+    return images
 
 
 class ToolTip:
@@ -452,7 +488,13 @@ class MediaTable(ttk.Frame):
     def __init__(self, parent: tk.Misc, columns: tuple[str, ...]):
         super().__init__(parent)
         self.columns = columns
-        self.tree = ttk.Treeview(self, columns=columns, show="headings", height=10, selectmode="extended")
+        self.icons = getattr(parent.winfo_toplevel(), "icons", {})
+        self.tree = ttk.Treeview(
+            self, columns=columns, show=("tree", "headings"), height=10,
+            selectmode="extended",
+        )
+        self.tree.heading("#0", text="")
+        self.tree.column("#0", width=22, minwidth=18, stretch=False, anchor="center")
         for column in columns:
             label, width = self.COLUMN_DEFINITIONS[column]
             self.tree.heading(column, text=label)
@@ -473,7 +515,8 @@ class MediaTable(ttk.Frame):
     def populate(self, rows: list[Any], positions: dict[int, int], channel_paused: bool = False) -> None:
         signature = tuple(
             (
-                int(row["id"]), row["status"], int(row["bytes_downloaded"]), row["error"],
+                int(row["id"]), row["status"], row["error"],
+                int(row["priority_level"]), int(row["priority_rank"]),
                 row["message_date"], row["downloaded_at"],
                 positions.get(int(row["id"])) if row["status"] == "queued" and not channel_paused else None,
                 channel_paused,
@@ -488,15 +531,13 @@ class MediaTable(ttk.Frame):
             media_id = int(row["id"])
             status = row["status"]
             size = int(row["size_bytes"])
-            done = int(row["bytes_downloaded"])
             duration = int(row["duration_seconds"])
             if status == "queued" and channel_paused:
                 display_status = "Paused"
             elif status == "queued":
                 display_status = f"Queued (position {positions.get(media_id, '?')})"
             elif status == "downloading":
-                percent = min(100, round(done * 100 / size)) if size else 0
-                display_status = f"Paused ({percent}%)" if channel_paused else f"Downloading ({percent}%)"
+                display_status = "Paused" if channel_paused else "Downloading"
             else:
                 display_status = status.capitalize()
             values = {
@@ -508,7 +549,15 @@ class MediaTable(ttk.Frame):
                 "date_downloaded": (row["downloaded_at"] or "").replace("T", " ")[:19],
                 "error": row["error"] or "",
             }
-            self.tree.insert("", "end", iid=str(media_id), values=tuple(values[column] for column in self.columns))
+            item_priority = priority_name(int(row["priority_level"]))
+            image = self.icons.get(f"{item_priority}-priority-marker")
+            options: dict[str, Any] = {
+                "text": "",
+                "values": tuple(values[column] for column in self.columns),
+            }
+            if image is not None:
+                options["image"] = image
+            self.tree.insert("", "end", iid=str(media_id), **options)
 
 
 class BlueProgressBar(tk.Canvas):
@@ -548,8 +597,18 @@ class ChannelPanel(ttk.LabelFrame):
     PAGE_SIZES = {"queue": 200, "downloaded": 100, "failed": 100}
 
     def __init__(self, parent: tk.Misc, channel: Channel, db: Database, engine: DownloaderEngine):
-        super().__init__(parent, text=channel.title, padding=10)
+        super().__init__(parent, padding=10)
         self.channel, self.db, self.engine = channel, db, engine
+        self.title_text = tk.StringVar(value=channel.title)
+        title_widget = ttk.Frame(self)
+        self.channel_priority_marker = tk.Canvas(
+            title_widget, width=5, height=16,
+            background=self.winfo_toplevel().cget("background"),
+            highlightthickness=0, borderwidth=0,
+        )
+        self.channel_priority_marker.pack(side="left", padx=(0, 5))
+        ttk.Label(title_widget, textvariable=self.title_text).pack(side="left")
+        self.configure(labelwidget=title_widget)
         self.page_numbers = {"queue": 0, "downloaded": 0, "failed": 0}
         self.tables: dict[str, MediaTable] = {}
         self.page_labels: dict[str, tk.StringVar] = {}
@@ -579,6 +638,16 @@ class ChannelPanel(ttk.LabelFrame):
             command=self.toggle_channel_pause,
         )
         self.channel_pause_button.pack(side="right", padx=(0, 6))
+        self.channel_priority_down_button = IconButton(
+            header, "priority-down", "Lower channel priority",
+            command=lambda: self.shift_channel_priority(1),
+        )
+        self.channel_priority_down_button.pack(side="right", padx=(0, 6))
+        self.channel_priority_up_button = IconButton(
+            header, "priority-up", "Raise channel priority",
+            command=lambda: self.shift_channel_priority(-1),
+        )
+        self.channel_priority_up_button.pack(side="right", padx=(0, 6))
         self.progress = BlueProgressBar(header)
         self.progress.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
@@ -622,6 +691,14 @@ class ChannelPanel(ttk.LabelFrame):
             IconButton(
                 controls, "remove", "Remove channel", command=self.remove_channel,
             ).pack(side="left", padx=(6, 0))
+        IconButton(
+            controls, "priority-up", "Raise selected files priority",
+            command=lambda selected=kind: self.shift_selected_file_priority(selected, -1),
+        ).pack(side="left", padx=(6, 0))
+        IconButton(
+            controls, "priority-down", "Lower selected files priority",
+            command=lambda selected=kind: self.shift_selected_file_priority(selected, 1),
+        ).pack(side="left", padx=(6, 0))
         label = tk.StringVar(value="Page 1 of 1")
         self.page_labels[kind] = label
         IconButton(
@@ -660,6 +737,22 @@ class ChannelPanel(ttk.LabelFrame):
 
     def rescan(self) -> None:
         self.engine.command("rescan", channel_id=self.channel.id)
+
+    def shift_channel_priority(self, amount: int) -> None:
+        self.db.shift_channel_priority(self.channel.id, amount)
+        self.channel = next(channel for channel in self.db.channels() if channel.id == self.channel.id)
+        self.refresh(self.db.queue_positions())
+
+    def shift_selected_file_priority(self, kind: str, amount: int) -> None:
+        ids = self.tables[kind].selected_ids()
+        if not ids:
+            messagebox.showinfo(
+                "Set priority", "Select one or more files first.", parent=self,
+            )
+            return
+        self.db.shift_media_priority(ids, amount)
+        self.table_revisions[kind] = -1
+        self.refresh(self.db.queue_positions())
 
     def toggle_channel_pause(self) -> None:
         paused = not self.channel.paused
@@ -716,6 +809,19 @@ class ChannelPanel(ttk.LabelFrame):
             "play" if self.channel.paused else "pause",
             "Resume channel" if self.channel.paused else "Pause channel",
         )
+        priority = priority_name(self.channel.priority_level)
+        self.channel_priority_marker.delete("all")
+        color = PRIORITY_COLORS[priority]
+        if color is not None:
+            self.channel_priority_marker.create_rectangle(
+                0, 0, 5, 16, fill=color, outline="",
+            )
+        self.channel_priority_up_button.configure(
+            state="disabled" if priority == "high" else "normal",
+        )
+        self.channel_priority_down_button.configure(
+            state="disabled" if priority == "low" else "normal",
+        )
         revision = self.db.revision
         if revision != self.count_revision:
             self.cached_counts = {
@@ -725,12 +831,12 @@ class ChannelPanel(ttk.LabelFrame):
         counts = self.cached_counts
         title = f"{self.channel.title} (Paused)" if self.channel.paused else self.channel.title
         if self.collapsed:
-            self.configure(
-                text=(f"{title}    Queue: {counts['queue']}    "
-                      f"Downloaded: {counts['downloaded']}    Failed: {counts['failed']}")
+            self.title_text.set(
+                f"{title}    Queue: {counts['queue']}    "
+                f"Downloaded: {counts['downloaded']}    Failed: {counts['failed']}"
             )
         else:
-            self.configure(text=title)
+            self.title_text.set(title)
         minimum = f"{self.channel.min_duration_seconds // 60}:{self.channel.min_duration_seconds % 60:02d}"
         file_types = ", ".join(self.channel.media_types) if self.channel.media_types else "All file types"
         self.stats.set(
@@ -826,6 +932,7 @@ class ConnectionPill(tk.Canvas):
 class DownloaderApp(tk.Tk):
     def __init__(self, config: Config, db: Database):
         super().__init__()
+        self.app_icon_images = apply_application_icon(self)
         ttk.Style(self).configure("Icon.TButton", padding=(6, 5))
         self.icons = load_icons(self)
         self.db = db
@@ -1000,4 +1107,5 @@ class DownloaderApp(tk.Tk):
 
 
 def create_application(config: Config, db: Database) -> DownloaderApp:
+    set_windows_app_identity()
     return DownloaderApp(config, db)

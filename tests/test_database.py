@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 from tg_downloader.database import Database
@@ -75,6 +76,105 @@ class DatabaseTests(unittest.TestCase):
         self.add(2, priority=0)
         self.assertEqual(2, self.db.next_queued()["message_id"])
         self.assertEqual({2: 1, 1: 2}, self.db.queue_positions())
+
+    def test_channel_and_file_priorities_control_queue_with_hidden_rank(self) -> None:
+        self.add(1)
+        self.add(2)
+        second_id = self.db.add_channel("second", 456, "Second", "Second", 0, 0)
+        second = next(channel for channel in self.db.channels() if channel.id == second_id)
+        self.db.add_media(
+            channel=second, message_id=3, document_id=3, file_name="second.mp3",
+            size_bytes=5_000, duration_seconds=120, message_date="2026-02-01T00:00:00+00:00",
+            priority=10,
+        )
+
+        self.db.set_channel_priority(second_id, "high")
+        self.assertEqual(3, self.db.next_queued()["message_id"])
+
+        self.db.set_channel_priority(second_id, "low")
+        own_rows = {int(row["message_id"]): int(row["id"]) for row in self.db.media_for_channel(self.channel.id)}
+        self.db.set_media_priority([own_rows[1]], "high")
+        self.db.set_media_priority([own_rows[2]], "low")
+        self.assertEqual(1, self.db.next_queued()["message_id"])
+
+        # Reassigning inside a level gives the item a new internal rank at the front.
+        self.db.set_media_priority([own_rows[2]], "high")
+        self.assertEqual(2, self.db.next_queued()["message_id"])
+        reopened_second = next(channel for channel in Database(self.path).channels() if channel.id == second_id)
+        self.assertEqual(2, reopened_second.priority_level)
+
+    def test_invalid_priority_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.db.set_channel_priority(self.channel.id, "urgent")
+
+    def test_priority_shift_buttons_move_one_level_and_stop_at_boundaries(self) -> None:
+        self.add(1)
+        self.add(2)
+        rows = {int(row["message_id"]): int(row["id"]) for row in self.db.media_for_channel(self.channel.id)}
+
+        self.db.shift_channel_priority(self.channel.id, -1)
+        self.assertEqual(0, next(channel for channel in self.db.channels() if channel.id == self.channel.id).priority_level)
+        self.db.shift_channel_priority(self.channel.id, -1)
+        self.assertEqual(0, next(channel for channel in self.db.channels() if channel.id == self.channel.id).priority_level)
+
+        self.db.shift_media_priority([rows[1], rows[2]], -1)
+        levels = {
+            int(row["message_id"]): int(row["priority_level"])
+            for row in self.db.media_for_channel(self.channel.id)
+        }
+        self.assertEqual({1: 0, 2: 0}, levels)
+        self.db.shift_media_priority([rows[2]], 1)
+        self.db.shift_media_priority([rows[2]], 1)
+        self.db.shift_media_priority([rows[2]], 1)
+        levels = {
+            int(row["message_id"]): int(row["priority_level"])
+            for row in self.db.media_for_channel(self.channel.id)
+        }
+        self.assertEqual({1: 0, 2: 2}, levels)
+
+    def test_existing_database_is_migrated_to_priority_columns(self) -> None:
+        legacy_path = Path(self.temp.name) / "legacy.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        try:
+            connection.executescript("""
+                CREATE TABLE channels (
+                    id INTEGER PRIMARY KEY, telegram_id INTEGER UNIQUE,
+                    identifier TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+                    folder TEXT NOT NULL, min_duration_seconds INTEGER NOT NULL DEFAULT 0,
+                    min_size_bytes INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+                    paused INTEGER NOT NULL DEFAULT 0, media_types TEXT NOT NULL DEFAULT '',
+                    scan_complete INTEGER NOT NULL DEFAULT 0,
+                    last_seen_message_id INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE media (
+                    id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL, telegram_document_id INTEGER,
+                    file_name TEXT NOT NULL, size_bytes INTEGER NOT NULL DEFAULT 0,
+                    duration_seconds INTEGER NOT NULL DEFAULT 0, message_date TEXT,
+                    status TEXT NOT NULL DEFAULT 'queued', priority INTEGER NOT NULL DEFAULT 10,
+                    bytes_downloaded INTEGER NOT NULL DEFAULT 0, output_path TEXT,
+                    error TEXT, downloaded_at TEXT,
+                    discovered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(channel_id, message_id)
+                );
+                CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO channels(identifier, telegram_id, title, folder)
+                VALUES('legacy', 999, 'Legacy', 'Legacy');
+            """)
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = Database(legacy_path)
+        channel = migrated.channels()[0]
+        self.assertEqual(1, channel.priority_level)
+        self.assertEqual(channel.id, channel.priority_rank)
+        with migrated.connect() as connection:
+            media_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(media)")
+            }
+        self.assertTrue({"priority_level", "priority_rank"}.issubset(media_columns))
 
     def test_downloaded_record_survives_missing_local_file_and_restart(self) -> None:
         self.add(1)
