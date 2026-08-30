@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 from typing import Any
@@ -30,6 +31,81 @@ except ImportError:
         save_mtproto_proxy,
     )
     from proxy_check import check_mtproto_proxy, sanitized_proxy_error
+
+
+ICON_NAMES = (
+    "add", "collapse", "expand", "failed", "pause",
+    "play", "queue", "refresh", "settings", "success",
+)
+
+
+def load_icons(master: tk.Misc) -> dict[str, tk.PhotoImage]:
+    icon_directory = Path(__file__).resolve().parent.parent / "assets" / "png"
+    icons: dict[str, tk.PhotoImage] = {}
+    for name in ICON_NAMES:
+        try:
+            icons[name] = tk.PhotoImage(master=master, file=str(icon_directory / f"{name}.png"))
+        except tk.TclError:
+            pass
+    return icons
+
+
+class ToolTip:
+    def __init__(self, widget: tk.Widget, text: str):
+        self.widget = widget
+        self.text = text
+        self.show_job: str | None = None
+        self.window: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+
+    def set_text(self, text: str) -> None:
+        self.text = text
+
+    def _schedule(self, _event: Any = None) -> None:
+        self.hide()
+        self.show_job = self.widget.after(450, self.show)
+
+    def show(self) -> None:
+        self.show_job = None
+        if self.window is not None or not self.widget.winfo_exists():
+            return
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        self.window.wm_geometry(f"+{self.widget.winfo_rootx() + 4}+{self.widget.winfo_rooty() + self.widget.winfo_height() + 5}")
+        tk.Label(
+            self.window, text=self.text, background="#fffce8", foreground="#222222",
+            relief="solid", borderwidth=1, padx=7, pady=4, font=("Segoe UI", 9),
+        ).pack()
+
+    def hide(self, _event: Any = None) -> None:
+        if self.show_job is not None:
+            self.widget.after_cancel(self.show_job)
+            self.show_job = None
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
+
+
+class IconButton(ttk.Button):
+    def __init__(
+        self, parent: tk.Misc, icon_name: str, tooltip: str,
+        command: Any, **options: Any,
+    ):
+        self.icons = getattr(parent.winfo_toplevel(), "icons", {})
+        image = self.icons.get(icon_name)
+        if image is not None:
+            options.update(image=image, style="Icon.TButton")
+        else:
+            options.update(text=tooltip)
+        super().__init__(parent, command=command, **options)
+        self.tooltip = ToolTip(self, tooltip)
+
+    def set_icon(self, icon_name: str, tooltip: str) -> None:
+        image = self.icons.get(icon_name)
+        self.configure(image=image, text="" if image is not None else tooltip)
+        self.tooltip.set_text(tooltip)
 
 
 class AddChannelDialog(tk.Toplevel):
@@ -289,6 +365,39 @@ class MediaTable(ttk.Frame):
             self.tree.insert("", "end", iid=str(media_id), values=tuple(values[column] for column in self.columns))
 
 
+class BlueProgressBar(tk.Canvas):
+    """Compact determinate progress bar using the application's blue palette."""
+
+    TRACK = "#eaf3fb"
+    BORDER = "#bad7ee"
+    FILL = "#82bdf0"
+
+    def __init__(self, parent: tk.Misc):
+        background = parent.winfo_toplevel().cget("background")
+        super().__init__(
+            parent, height=14, background=background,
+            highlightthickness=0, borderwidth=0,
+        )
+        self.value = 0.0
+        self.bind("<Configure>", self._redraw)
+
+    def set_value(self, value: float) -> None:
+        self.value = min(100.0, max(0.0, float(value)))
+        self._redraw()
+
+    def _redraw(self, _event: Any = None) -> None:
+        width = max(2, self.winfo_width())
+        height = max(4, self.winfo_height())
+        self.delete("progress")
+        self.create_rectangle(
+            1, 1, width - 1, height - 1, fill=self.TRACK, outline=self.BORDER, tags="progress",
+        )
+        fill_right = 1 + round((width - 2) * self.value / 100)
+        if fill_right <= 1:
+            return
+        self.create_rectangle(1, 1, fill_right, height - 1, fill=self.FILL, outline="", tags="progress")
+
+
 class ChannelPanel(ttk.LabelFrame):
     PAGE_SIZES = {"queue": 200, "downloaded": 100, "failed": 100}
 
@@ -310,10 +419,13 @@ class ChannelPanel(ttk.LabelFrame):
         self.current = tk.StringVar(value="Current file: Waiting for next file")
         self.progress_text = tk.StringVar(value="0%")
         self.stats = tk.StringVar()
+        self.icons = getattr(parent.winfo_toplevel(), "icons", {})
 
         header = ttk.Frame(self)
         header.pack(fill="x", pady=(0, 5))
-        self.collapse_button = ttk.Button(header, text="Collapse details", command=self.toggle_details)
+        self.collapse_button = IconButton(
+            header, "collapse", "Collapse details", command=self.toggle_details,
+        )
         self.collapse_button.pack(side="right")
 
         self.details = ttk.Frame(self)
@@ -325,7 +437,7 @@ class ChannelPanel(ttk.LabelFrame):
         ttk.Label(current_row, textvariable=self.progress_text, anchor="e").grid(
             row=0, column=1, sticky="e", padx=(12, 0),
         )
-        self.progress = ttk.Progressbar(self.details, maximum=100)
+        self.progress = BlueProgressBar(self.details)
         self.progress.pack(fill="x", pady=(0, 5))
         ttk.Label(self.details, textvariable=self.stats).pack(fill="x", pady=(0, 7))
         self.notebook = ttk.Notebook(self.details)
@@ -338,7 +450,10 @@ class ChannelPanel(ttk.LabelFrame):
     def make_tab(self, kind: str, columns: tuple[str, ...]) -> None:
         page = ttk.Frame(self.notebook, padding=5)
         self.tab_indexes[kind] = len(self.tab_indexes)
-        self.notebook.add(page, text=kind.capitalize())
+        icon_name = "success" if kind == "downloaded" else kind
+        self.notebook.add(
+            page, text=kind.capitalize(), image=self.icons.get(icon_name), compound="left",
+        )
         table = MediaTable(page, columns)
         self.tables[kind] = table
         table.pack(fill="both", expand=True)
@@ -349,7 +464,9 @@ class ChannelPanel(ttk.LabelFrame):
         elif kind == "failed":
             ttk.Button(controls, text="Retry failed", command=self.retry_failed).pack(side="left")
         else:
-            ttk.Button(controls, text="Check for new files", command=self.rescan).pack(side="left")
+            IconButton(
+                controls, "refresh", "Check for new files", command=self.rescan,
+            ).pack(side="left")
             ttk.Button(
                 controls, text="Remove channel", command=self.remove_channel,
             ).pack(side="left", padx=(6, 0))
@@ -371,10 +488,10 @@ class ChannelPanel(ttk.LabelFrame):
         self.collapsed = not self.collapsed
         if self.collapsed:
             self.notebook.pack_forget()
-            self.collapse_button.configure(text="Expand details")
+            self.collapse_button.set_icon("expand", "Expand details")
         else:
             self.notebook.pack(fill="both", expand=True)
-            self.collapse_button.configure(text="Collapse details")
+            self.collapse_button.set_icon("collapse", "Collapse details")
             self.table_revisions[self.selected_tab()] = -1
         self.refresh(self.cached_positions)
 
@@ -455,12 +572,12 @@ class ChannelPanel(ttk.LabelFrame):
             self.last_active_id, self.last_bytes, self.last_time = media_id, done, now
             percent = min(100, round(done * 100 / size)) if size else 0
             self.current.set(f"Current file: {active['file_name']}")
-            self.progress["value"] = percent
+            self.progress.set_value(percent)
             self.progress_text.set(f"{percent}%    {format_bytes(done)} / {format_bytes(size)}    {format_bytes(round(speed))}/s")
         else:
             self.last_active_id = None
             self.current.set("Current file: Waiting for next file")
-            self.progress["value"] = 0
+            self.progress.set_value(0)
             self.progress_text.set("0%")
         for kind, count in counts.items():
             self.notebook.tab(self.tab_indexes[kind], text=f"{kind.capitalize()} ({count})")
@@ -530,6 +647,8 @@ class ConnectionPill(tk.Canvas):
 class DownloaderApp(tk.Tk):
     def __init__(self, config: Config, db: Database):
         super().__init__()
+        ttk.Style(self).configure("Icon.TButton", padding=(6, 5))
+        self.icons = load_icons(self)
         self.db = db
         self.config = config
         self.events: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
@@ -553,11 +672,17 @@ class DownloaderApp(tk.Tk):
     def build_toolbar(self) -> None:
         toolbar = ttk.Frame(self, padding=8)
         toolbar.pack(fill="x")
-        ttk.Button(toolbar, text="Add channel", command=self.add_channel).pack(side="left")
-        self.pause_button = ttk.Button(toolbar, text="Pause downloads", command=self.toggle_pause)
+        IconButton(toolbar, "add", "Add channel", command=self.add_channel).pack(side="left")
+        self.pause_button = IconButton(
+            toolbar, "pause", "Pause downloads", command=self.toggle_pause,
+        )
         self.pause_button.pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="Check all channels", command=self.refresh_all).pack(side="left", padx=(6, 0))
-        ttk.Button(toolbar, text="Settings", command=self.open_settings).pack(side="left", padx=(6, 0))
+        IconButton(
+            toolbar, "refresh", "Check all channels", command=self.refresh_all,
+        ).pack(side="left", padx=(6, 0))
+        IconButton(
+            toolbar, "settings", "Settings", command=self.open_settings,
+        ).pack(side="left", padx=(6, 0))
         self.reconnect_button = ttk.Button(toolbar, text="Reconnect", command=self.reconnect, state="disabled")
         self.reconnect_button.pack(side="left", padx=(6, 0))
         ttk.Label(toolbar, text="Speed limit:").pack(side="left", padx=(18, 5))
@@ -616,7 +741,7 @@ class DownloaderApp(tk.Tk):
         self.error_message.set("")
         self.reconnect_button.configure(state="disabled")
         self.paused = False
-        self.pause_button.configure(text="Pause downloads")
+        self.pause_button.set_icon("pause", "Pause downloads")
         self.engine.start()
 
     def refresh_all(self) -> None:
@@ -643,9 +768,9 @@ class DownloaderApp(tk.Tk):
             return
         self.paused = target_paused
         if self.paused:
-            self.pause_button.configure(text="Resume downloads")
+            self.pause_button.set_icon("play", "Resume downloads")
         else:
-            self.pause_button.configure(text="Pause downloads")
+            self.pause_button.set_icon("pause", "Pause downloads")
 
     def handle_event(self, event: str, data: dict[str, Any]) -> None:
         if event == "fatal":
