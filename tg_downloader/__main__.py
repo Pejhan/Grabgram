@@ -18,10 +18,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Channel Media Downloader desktop application")
     parser.add_argument("--config", type=Path, default=Path("config.json"))
     args = parser.parse_args()
-    if __package__:
-        from .ui import create_application
-    else:
-        from ui import create_application
+    try:
+        if __package__:
+            from .ui import create_application
+        else:
+            from ui import create_application
+    except ModuleNotFoundError as exc:
+        if exc.name == "PIL":
+            print(
+                "Cannot start: Pillow is not installed for this Python interpreter.\n"
+                f'Run: "{sys.executable}" -m pip install -r requirements.txt',
+                file=sys.stderr,
+            )
+            raise SystemExit(2) from exc
+        raise
 
     instance_lock = None
     try:

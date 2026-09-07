@@ -9,8 +9,10 @@ import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import font as tkfont
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 from typing import Any
+
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 
 try:
     from .config import Config
@@ -35,12 +37,102 @@ except ImportError:
 
 
 ICON_NAMES = (
-    "add", "collapse", "expand", "failed", "pause",
-    "play", "queue", "refresh", "settings", "success",
+    "add", "failed", "pause", "play", "queue", "refresh", "settings", "success",
     "previous", "next", "remove", "priority-up", "priority-down",
 )
 
 PRIORITY_COLORS = {"high": "#34a853", "medium": None, "low": "#d93025"}
+
+APP_BACKGROUND = "#f3f5f7"
+SIDEBAR_BACKGROUND = "#eef1f4"
+CONTENT_BACKGROUND = "#ffffff"
+TEXT_COLOR = "#20252b"
+MUTED_TEXT = "#66717d"
+ACCENT = "#1677ff"
+BORDER_COLOR = "#dfe4e8"
+
+
+def configure_application_theme(window: tk.Tk) -> None:
+    """Apply the restrained desktop palette used by the main workspace."""
+    window.configure(background=APP_BACKGROUND)
+    style = ttk.Style(window)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure(".", font=("Segoe UI", 9), foreground=TEXT_COLOR)
+    style.configure("App.TFrame", background=APP_BACKGROUND)
+    style.configure("Topbar.TFrame", background=CONTENT_BACKGROUND)
+    style.configure("Sidebar.TFrame", background=SIDEBAR_BACKGROUND)
+    style.configure("Content.TFrame", background=CONTENT_BACKGROUND)
+    style.configure("Topbar.TLabel", background=CONTENT_BACKGROUND, foreground=TEXT_COLOR)
+    style.configure(
+        "Brand.TLabel", background=CONTENT_BACKGROUND, foreground=TEXT_COLOR,
+        font=("Segoe UI Semibold", 13),
+    )
+    style.configure(
+        "SidebarTitle.TLabel", background=SIDEBAR_BACKGROUND, foreground=MUTED_TEXT,
+        font=("Segoe UI Semibold", 9),
+    )
+    style.configure(
+        "ChannelTitle.TLabel", background=CONTENT_BACKGROUND, foreground=TEXT_COLOR,
+        font=("Segoe UI Semibold", 15),
+    )
+    style.configure("Content.TLabel", background=CONTENT_BACKGROUND, foreground=TEXT_COLOR)
+    style.configure("Muted.TLabel", background=CONTENT_BACKGROUND, foreground=MUTED_TEXT)
+    style.configure(
+        "Error.TLabel", background="#fce8e6", foreground="#b3261e",
+        font=("Segoe UI", 9),
+    )
+    style.configure(
+        "Icon.TButton", background=CONTENT_BACKGROUND, bordercolor=BORDER_COLOR,
+        lightcolor=CONTENT_BACKGROUND, darkcolor=CONTENT_BACKGROUND,
+        padding=(7, 6), relief="flat",
+    )
+    style.map(
+        "Icon.TButton",
+        background=[("active", "#f0f5fa"), ("pressed", "#e5edf5")],
+        bordercolor=[("focus", ACCENT), ("active", "#cbd5df")],
+    )
+    style.configure(
+        "Primary.TButton", background=ACCENT, foreground="#ffffff",
+        bordercolor=ACCENT, padding=(12, 7), relief="flat",
+    )
+    style.map(
+        "Primary.TButton",
+        background=[("active", "#0b68df"), ("pressed", "#0759c5")],
+        foreground=[("disabled", "#d7e6fb")],
+    )
+    style.configure(
+        "Media.Treeview", background=CONTENT_BACKGROUND, fieldbackground=CONTENT_BACKGROUND,
+        foreground=TEXT_COLOR, borderwidth=0, relief="flat", rowheight=36,
+    )
+    style.configure(
+        "Media.Treeview.Heading", background="#f7f8fa", foreground=MUTED_TEXT,
+        bordercolor=BORDER_COLOR, borderwidth=1, relief="flat",
+        font=("Segoe UI Semibold", 9), padding=(8, 7),
+    )
+    style.map(
+        "Media.Treeview",
+        background=[("selected", "#dcebff")], foreground=[("selected", TEXT_COLOR)],
+    )
+    style.map("Media.Treeview.Heading", background=[("active", "#edf2f7")])
+    style.configure(
+        "Workspace.TNotebook", background=CONTENT_BACKGROUND, borderwidth=0,
+        tabmargins=(0, 0, 0, 0),
+    )
+    style.configure(
+        "Workspace.TNotebook.Tab", background="#e8ecef", foreground="#59636e",
+        bordercolor="#cfd6dd", lightcolor="#cfd6dd", darkcolor="#cfd6dd",
+        borderwidth=1, relief="flat", padding=(14, 9), font=("Segoe UI Semibold", 9),
+    )
+    style.map(
+        "Workspace.TNotebook.Tab",
+        background=[("selected", CONTENT_BACKGROUND), ("active", "#dde4eb")],
+        foreground=[("selected", ACCENT), ("active", TEXT_COLOR)],
+        bordercolor=[("selected", "#c7d0d9"), ("active", "#c7d0d9")],
+        expand=[("selected", (0, 0, 0, 0))],
+    )
 
 
 def load_icons(master: tk.Misc) -> dict[str, tk.PhotoImage]:
@@ -59,6 +151,71 @@ def load_icons(master: tk.Misc) -> dict[str, tk.PhotoImage]:
         icons[f"{priority}-priority-marker"] = marker
     return icons
 
+
+class AvatarStore:
+    """Load, crop, and retain channel avatars at the sizes used by the UI."""
+
+    FALLBACK_COLORS = ("#557a95", "#6c70a8", "#4f8b78", "#8a6f9e", "#9a7158")
+
+    def __init__(self, master: tk.Misc, directory: Path):
+        self.master = master
+        self.directory = directory
+        self.cache: dict[tuple[int, int, int], tk.PhotoImage] = {}
+
+    def invalidate(self, channel_id: int) -> None:
+        self.cache = {
+            key: image for key, image in self.cache.items() if key[0] != channel_id
+        }
+
+    def get(self, channel: Channel, size: int) -> tk.PhotoImage:
+        path = self.directory / f"{channel.telegram_id}.jpg" if channel.telegram_id else None
+        modified = path.stat().st_mtime_ns if path is not None and path.exists() else 0
+        key = (channel.id, size, modified)
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached
+        image = self._render(path, channel.title, channel.telegram_id or channel.id, size)
+        self.cache[key] = image
+        return image
+
+    def _render(self, path: Path | None, title: str, identity: int, size: int) -> tk.PhotoImage:
+        scale = 4
+        render_size = size * scale
+        source = None
+        if path is not None and path.exists():
+            try:
+                with Image.open(path) as opened:
+                    source = ImageOps.fit(
+                        ImageOps.exif_transpose(opened).convert("RGB"),
+                        (render_size, render_size), method=Image.Resampling.LANCZOS,
+                    )
+            except (OSError, ValueError):
+                source = None
+        if source is None:
+            source = self._initial_fallback(title, identity, render_size)
+        mask = Image.new("L", (render_size, render_size), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, render_size - 1, render_size - 1), fill=255)
+        avatar = Image.new("RGBA", (render_size, render_size), (0, 0, 0, 0))
+        avatar.paste(source, (0, 0), mask)
+        avatar = avatar.resize((size, size), Image.Resampling.LANCZOS)
+        return ImageTk.PhotoImage(avatar, master=self.master)
+
+    def _initial_fallback(self, title: str, identity: int, size: int) -> Any:
+        color = self.FALLBACK_COLORS[abs(int(identity)) % len(self.FALLBACK_COLORS)]
+        image = Image.new("RGB", (size, size), color)
+        initial = next((character.upper() for character in title.strip() if character.isalnum()), "?")
+        try:
+            font = ImageFont.truetype("segoeuib.ttf", max(12, round(size * 0.43)))
+        except OSError:
+            font = ImageFont.load_default(size=max(12, round(size * 0.43)))
+        draw = ImageDraw.Draw(image)
+        bounds = draw.textbbox((0, 0), initial, font=font)
+        width, height = bounds[2] - bounds[0], bounds[3] - bounds[1]
+        draw.text(
+            ((size - width) / 2 - bounds[0], (size - height) / 2 - bounds[1] - 1),
+            initial, fill="#ffffff", font=font,
+        )
+        return image
 
 def set_windows_app_identity() -> None:
     """Give Windows a stable taskbar identity instead of grouping under Python."""
@@ -241,12 +398,12 @@ class AddChannelDialog(tk.Toplevel):
         self.refresh_types_button.grid(row=2, column=2, padx=(6, 12), pady=7)
         ttk.Label(self, text="Minimum length (minutes):").grid(row=3, column=0, sticky="w", padx=12, pady=7)
         ttk.Combobox(
-            self, textvariable=self.duration, values=("1", "2", "5", "10", "60"),
+            self, textvariable=self.duration, values=("0", "1", "2", "5", "10", "60"),
             state="readonly", width=12,
         ).grid(row=3, column=1, sticky="w", pady=7)
         ttk.Label(self, text="Minimum size (MB):").grid(row=4, column=0, sticky="w", padx=12, pady=7)
         ttk.Combobox(
-            self, textvariable=self.size, values=("2", "10", "50", "100"),
+            self, textvariable=self.size, values=("0", "2", "10", "50", "100"),
             state="readonly", width=12,
         ).grid(row=4, column=1, sticky="w", pady=7)
 
@@ -474,6 +631,139 @@ class SettingsDialog(tk.Toplevel):
             )
 
 
+class AutoScrollbar(ttk.Scrollbar):
+    """Hide table scrollbars when the full data range is already visible."""
+
+    def set(self, first: str, last: str) -> None:
+        if float(first) <= 0.0 and float(last) >= 1.0:
+            self.grid_remove()
+        else:
+            self.grid()
+        super().set(first, last)
+
+
+class RoundedNotebook(ttk.Frame):
+    """Notebook-like container with fixed-height, genuinely rounded tabs."""
+
+    TAB_HEIGHT = 34
+    TAB_GAP = 5
+    TAB_RADIUS = 7
+
+    def __init__(self, parent: tk.Misc):
+        super().__init__(parent, style="Content.TFrame")
+        self.tabs: list[dict[str, Any]] = []
+        self.selected_index = -1
+        self.tab_bounds: list[tuple[int, int]] = []
+        self.rendered_tabs: list[Any] = []
+        self.tab_font = tkfont.Font(parent, family="Segoe UI", size=9, weight="bold")
+        self.tab_bar = tk.Canvas(
+            self, height=self.TAB_HEIGHT + 8, background=CONTENT_BACKGROUND,
+            highlightthickness=0, borderwidth=0,
+        )
+        self.tab_bar.pack(fill="x")
+        self.tab_bar.bind("<Button-1>", self._clicked)
+        self.tab_bar.bind("<Configure>", lambda _event: self._redraw())
+
+    def add(self, page: tk.Widget, **options: Any) -> None:
+        self.tabs.append({
+            "page": page,
+            "text": str(options.get("text", "")),
+            "image": options.get("image"),
+        })
+        if self.selected_index < 0:
+            self._show(0, notify=False)
+        else:
+            page.pack_forget()
+        self._redraw()
+
+    def select(self, tab_id: Any = None) -> int:
+        if tab_id is None:
+            return self.selected_index
+        index = self.index(tab_id)
+        self._show(index)
+        return index
+
+    def index(self, tab_id: Any) -> int:
+        if isinstance(tab_id, int):
+            return tab_id
+        for index, tab in enumerate(self.tabs):
+            if str(tab["page"]) == str(tab_id):
+                return index
+        raise tk.TclError(f"Unknown tab {tab_id}")
+
+    def tab(self, tab_id: Any, **options: Any) -> dict[str, Any] | None:
+        tab = self.tabs[self.index(tab_id)]
+        if not options:
+            return dict(tab)
+        if "text" in options:
+            tab["text"] = str(options["text"])
+        if "image" in options:
+            tab["image"] = options["image"]
+        self._redraw()
+        return None
+
+    def _show(self, index: int, notify: bool = True) -> None:
+        if not 0 <= index < len(self.tabs):
+            return
+        changed = index != self.selected_index
+        if self.selected_index >= 0:
+            self.tabs[self.selected_index]["page"].pack_forget()
+        self.selected_index = index
+        self.tabs[index]["page"].pack(fill="both", expand=True)
+        self._redraw()
+        if changed and notify:
+            self.event_generate("<<NotebookTabChanged>>")
+
+    def _clicked(self, event: tk.Event) -> None:
+        for index, (left, right) in enumerate(self.tab_bounds):
+            if left <= event.x <= right:
+                self._show(index)
+                return
+
+    def _redraw(self) -> None:
+        self.tab_bar.delete("all")
+        self.tab_bounds = []
+        self.rendered_tabs = []
+        left = 0
+        top = 4
+        bottom = top + self.TAB_HEIGHT
+        for index, tab in enumerate(self.tabs):
+            image = tab.get("image")
+            image_width = image.width() if image is not None else 0
+            text_width = self.tab_font.measure(tab["text"])
+            width = 28 + text_width + image_width + (7 if image is not None else 0)
+            right = left + width
+            selected = index == self.selected_index
+            fill = CONTENT_BACKGROUND if selected else "#e3e7eb"
+            outline = "#c5ced7" if selected else "#d2d8de"
+            scale = 4
+            rendered = Image.new(
+                "RGBA", (width * scale, self.TAB_HEIGHT * scale), (0, 0, 0, 0),
+            )
+            ImageDraw.Draw(rendered).rounded_rectangle(
+                (scale, scale, width * scale - scale - 1, self.TAB_HEIGHT * scale - scale - 1),
+                radius=self.TAB_RADIUS * scale, fill=fill, outline=outline, width=scale,
+            )
+            rendered = rendered.resize(
+                (width, self.TAB_HEIGHT), Image.Resampling.LANCZOS,
+            )
+            tab_image = ImageTk.PhotoImage(rendered, master=self.tab_bar)
+            self.rendered_tabs.append(tab_image)
+            self.tab_bar.create_image(left, top, image=tab_image, anchor="nw")
+            content_left = left + 14
+            if image is not None:
+                self.tab_bar.create_image(
+                    content_left, (top + bottom) / 2, image=image, anchor="w",
+                )
+                content_left += image_width + 7
+            self.tab_bar.create_text(
+                content_left, (top + bottom) / 2, text=tab["text"], anchor="w",
+                fill=ACCENT if selected else "#59636e", font=self.tab_font,
+            )
+            self.tab_bounds.append((left, right))
+            left = right + self.TAB_GAP
+
+
 class MediaTable(ttk.Frame):
     COLUMN_DEFINITIONS = {
         "name": ("File name", 390),
@@ -491,16 +781,18 @@ class MediaTable(ttk.Frame):
         self.icons = getattr(parent.winfo_toplevel(), "icons", {})
         self.tree = ttk.Treeview(
             self, columns=columns, show=("tree", "headings"), height=10,
-            selectmode="extended",
+            selectmode="extended", style="Media.Treeview",
         )
+        self.tree.tag_configure("even", background=CONTENT_BACKGROUND)
+        self.tree.tag_configure("odd", background="#fafbfc")
         self.tree.heading("#0", text="")
         self.tree.column("#0", width=22, minwidth=18, stretch=False, anchor="center")
         for column in columns:
             label, width = self.COLUMN_DEFINITIONS[column]
             self.tree.heading(column, text=label)
             self.tree.column(column, width=width, minwidth=60, stretch=column in {"name", "error"})
-        yscroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        xscroll = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        yscroll = AutoScrollbar(self, orient="vertical", command=self.tree.yview)
+        xscroll = AutoScrollbar(self, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
@@ -527,7 +819,7 @@ class MediaTable(ttk.Frame):
             return
         self.signature = signature
         self.tree.delete(*self.tree.get_children())
-        for row in rows:
+        for row_index, row in enumerate(rows):
             media_id = int(row["id"])
             status = row["status"]
             size = int(row["size_bytes"])
@@ -554,6 +846,7 @@ class MediaTable(ttk.Frame):
             options: dict[str, Any] = {
                 "text": "",
                 "values": tuple(values[column] for column in self.columns),
+                "tags": ("even" if row_index % 2 == 0 else "odd",),
             }
             if image is not None:
                 options["image"] = image
@@ -568,9 +861,8 @@ class BlueProgressBar(tk.Canvas):
     FILL = "#82bdf0"
 
     def __init__(self, parent: tk.Misc):
-        background = parent.winfo_toplevel().cget("background")
         super().__init__(
-            parent, height=14, background=background,
+            parent, height=14, background=CONTENT_BACKGROUND,
             highlightthickness=0, borderwidth=0,
         )
         self.value = 0.0
@@ -593,22 +885,127 @@ class BlueProgressBar(tk.Canvas):
         self.create_rectangle(1, 1, fill_right, height - 1, fill=self.FILL, outline="", tags="progress")
 
 
-class ChannelPanel(ttk.LabelFrame):
+class ActiveDownloadIndicator(tk.Canvas):
+    """Show a smooth green pulse for an active channel."""
+
+    WIDTH = 20
+    HEIGHT = 20
+    COLOR = "#16a34a"
+    FRAME_MS = 33
+    CYCLE_SECONDS = 1.6
+    FRAME_COUNT = round(CYCLE_SECONDS * 1000 / FRAME_MS)
+    RENDER_SCALE = 4
+
+    def __init__(self, parent: tk.Misc):
+        super().__init__(
+            parent, width=self.WIDTH, height=self.HEIGHT,
+            background=SIDEBAR_BACKGROUND, highlightthickness=0, borderwidth=0,
+        )
+        self.active = False
+        self.started_at = 0.0
+        self.animation_job: str | None = None
+        self.frame_cache: dict[str, list[tk.PhotoImage]] = {}
+        self.rendered_frame: tk.PhotoImage | None = None
+
+    @staticmethod
+    def _blend(foreground: str, background: str, opacity: float) -> str:
+        foreground_rgb = tuple(int(foreground[index:index + 2], 16) for index in (1, 3, 5))
+        background_rgb = tuple(int(background[index:index + 2], 16) for index in (1, 3, 5))
+        mixed = (
+            round(front * opacity + back * (1.0 - opacity))
+            for front, back in zip(foreground_rgb, background_rgb)
+        )
+        return "#" + "".join(f"{component:02x}" for component in mixed)
+
+    def set_background(self, color: str) -> None:
+        self.configure(background=color)
+
+    def _frames_for_background(self, background: str) -> list[tk.PhotoImage]:
+        cached = self.frame_cache.get(background)
+        if cached is not None:
+            return cached
+        scale = self.RENDER_SCALE
+        frames: list[tk.PhotoImage] = []
+        for frame_index in range(self.FRAME_COUNT):
+            elapsed = frame_index * self.CYCLE_SECONDS / self.FRAME_COUNT
+            rendered = Image.new(
+                "RGB", (self.WIDTH * scale, self.HEIGHT * scale), background,
+            )
+            draw = ImageDraw.Draw(rendered)
+            center_x = self.WIDTH * scale / 2
+            center_y = self.HEIGHT * scale / 2
+            for delay in (0.0, self.CYCLE_SECONDS / 2):
+                phase = ((elapsed - delay) % self.CYCLE_SECONDS) / self.CYCLE_SECONDS
+                radius = (1.5 + (8.4 - 1.5) * phase) * scale
+                color = self._blend(self.COLOR, background, 0.9 * (1.0 - phase))
+                draw.ellipse(
+                    (
+                        center_x - radius, center_y - radius,
+                        center_x + radius, center_y + radius,
+                    ),
+                    fill=color,
+                )
+            dot_radius = 2.6 * scale
+            draw.ellipse(
+                (
+                    center_x - dot_radius, center_y - dot_radius,
+                    center_x + dot_radius, center_y + dot_radius,
+                ),
+                fill=self.COLOR,
+            )
+            rendered = rendered.resize(
+                (self.WIDTH, self.HEIGHT), Image.Resampling.LANCZOS,
+            )
+            frames.append(ImageTk.PhotoImage(rendered, master=self))
+        self.frame_cache[background] = frames
+        return frames
+
+    def set_active(self, active: bool) -> None:
+        active = bool(active)
+        if active == self.active:
+            return
+        self.active = active
+        if active:
+            self.started_at = time.monotonic()
+            self.pack(side="left", padx=(5, 0))
+            self._draw_frame()
+        else:
+            if self.animation_job is not None:
+                self.after_cancel(self.animation_job)
+                self.animation_job = None
+            self.delete("all")
+            self.pack_forget()
+
+    def _draw_frame(self) -> None:
+        if not self.active or not self.winfo_exists():
+            return
+        elapsed = time.monotonic() - self.started_at
+        background = str(self.cget("background"))
+        frames = self._frames_for_background(background)
+        frame_index = int(elapsed / self.CYCLE_SECONDS * self.FRAME_COUNT) % self.FRAME_COUNT
+        self.rendered_frame = frames[frame_index]
+        self.delete("all")
+        self.create_image(0, 0, image=self.rendered_frame, anchor="nw")
+        self.animation_job = self.after(self.FRAME_MS, self._draw_frame)
+
+    def destroy(self) -> None:
+        if self.animation_job is not None:
+            self.after_cancel(self.animation_job)
+            self.animation_job = None
+        super().destroy()
+
+
+class ChannelPanel(ttk.Frame):
     PAGE_SIZES = {"queue": 200, "downloaded": 100, "failed": 100}
 
-    def __init__(self, parent: tk.Misc, channel: Channel, db: Database, engine: DownloaderEngine):
-        super().__init__(parent, padding=10)
+    def __init__(
+        self, parent: tk.Misc, channel: Channel, db: Database,
+        engine: DownloaderEngine, avatar_store: AvatarStore,
+    ):
+        super().__init__(parent, padding=(22, 18, 22, 18), style="Content.TFrame")
         self.channel, self.db, self.engine = channel, db, engine
+        self.avatar_store = avatar_store
         self.title_text = tk.StringVar(value=channel.title)
-        title_widget = ttk.Frame(self)
-        self.channel_priority_marker = tk.Canvas(
-            title_widget, width=5, height=16,
-            background=self.winfo_toplevel().cget("background"),
-            highlightthickness=0, borderwidth=0,
-        )
-        self.channel_priority_marker.pack(side="left", padx=(0, 5))
-        ttk.Label(title_widget, textvariable=self.title_text).pack(side="left")
-        self.configure(labelwidget=title_widget)
         self.page_numbers = {"queue": 0, "downloaded": 0, "failed": 0}
         self.tables: dict[str, MediaTable] = {}
         self.page_labels: dict[str, tk.StringVar] = {}
@@ -620,24 +1017,33 @@ class ChannelPanel(ttk.LabelFrame):
         self.last_active_id: int | None = None
         self.last_bytes = 0
         self.last_time = time.monotonic()
-        self.collapsed = False
         self.current = tk.StringVar(value="Current file: Waiting for next file")
         self.progress_text = tk.StringVar(value="0%")
         self.stats = tk.StringVar()
         self.icons = getattr(parent.winfo_toplevel(), "icons", {})
 
-        header = ttk.Frame(self)
-        header.pack(fill="x", pady=(0, 5))
-        self.collapse_button = IconButton(
-            header, "collapse", "Collapse details", command=self.toggle_details,
-        )
-        self.collapse_button.pack(side="right")
+        header = ttk.Frame(self, style="Content.TFrame")
+        header.pack(fill="x", pady=(0, 12))
+        self.avatar_label = ttk.Label(header, style="Content.TLabel")
+        self.avatar_label.pack(side="left", padx=(0, 11))
+        self.set_avatar()
+        ttk.Label(
+            header, textvariable=self.title_text, style="ChannelTitle.TLabel",
+        ).pack(side="left", padx=(0, 18))
         self.channel_pause_button = IconButton(
             header, "play" if channel.paused else "pause",
             "Resume channel" if channel.paused else "Pause channel",
             command=self.toggle_channel_pause,
         )
         self.channel_pause_button.pack(side="right", padx=(0, 6))
+        self.remove_channel_button = IconButton(
+            header, "remove", "Remove channel", command=self.remove_channel,
+        )
+        self.remove_channel_button.pack(side="right", padx=(0, 6))
+        self.rescan_button = IconButton(
+            header, "refresh", "Check for new files", command=self.rescan,
+        )
+        self.rescan_button.pack(side="right", padx=(0, 6))
         self.channel_priority_down_button = IconButton(
             header, "priority-down", "Lower channel priority",
             command=lambda: self.shift_channel_priority(1),
@@ -649,27 +1055,37 @@ class ChannelPanel(ttk.LabelFrame):
         )
         self.channel_priority_up_button.pack(side="right", padx=(0, 6))
         self.progress = BlueProgressBar(header)
-        self.progress.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.progress.pack(side="left", fill="x", expand=True, padx=(0, 12))
 
-        self.details = ttk.Frame(self)
+        self.details = ttk.Frame(self, style="Content.TFrame")
         self.details.pack(fill="both", expand=True)
-        current_row = ttk.Frame(self.details)
+        current_row = ttk.Frame(self.details, style="Content.TFrame")
         current_row.pack(fill="x", pady=(0, 5))
         current_row.columnconfigure(0, weight=1)
-        ttk.Label(current_row, textvariable=self.current, width=1, anchor="w").grid(row=0, column=0, sticky="ew")
-        ttk.Label(current_row, textvariable=self.progress_text, anchor="e").grid(
+        ttk.Label(
+            current_row, textvariable=self.current, width=1, anchor="w", style="Content.TLabel",
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Label(
+            current_row, textvariable=self.progress_text, anchor="e", style="Muted.TLabel",
+        ).grid(
             row=0, column=1, sticky="e", padx=(12, 0),
         )
-        ttk.Label(self.details, textvariable=self.stats).pack(fill="x", pady=(0, 7))
-        self.notebook = ttk.Notebook(self.details)
+        ttk.Label(
+            self.details, textvariable=self.stats, style="Muted.TLabel",
+        ).pack(fill="x", pady=(0, 12))
+        self.notebook = RoundedNotebook(self.details)
         self.notebook.pack(fill="both", expand=True)
         self.make_tab("queue", ("name", "duration", "size", "status", "date_added"))
         self.make_tab("downloaded", ("name", "duration", "size", "date_downloaded"))
         self.make_tab("failed", ("name", "duration", "size", "date_added", "error"))
         self.notebook.bind("<<NotebookTabChanged>>", self.tab_changed)
 
+    def set_avatar(self) -> None:
+        self.avatar_image = self.avatar_store.get(self.channel, 42)
+        self.avatar_label.configure(image=self.avatar_image)
+
     def make_tab(self, kind: str, columns: tuple[str, ...]) -> None:
-        page = ttk.Frame(self.notebook, padding=5)
+        page = ttk.Frame(self.notebook, padding=(0, 8, 0, 0), style="Content.TFrame")
         self.tab_indexes[kind] = len(self.tab_indexes)
         icon_name = "success" if kind == "downloaded" else kind
         self.notebook.add(
@@ -678,23 +1094,16 @@ class ChannelPanel(ttk.LabelFrame):
         table = MediaTable(page, columns)
         self.tables[kind] = table
         table.pack(fill="both", expand=True)
-        controls = ttk.Frame(page)
+        controls = ttk.Frame(page, style="Content.TFrame")
         controls.pack(fill="x", pady=(6, 0))
         if kind == "downloaded":
             ttk.Button(controls, text="Redownload selected", command=self.redownload).pack(side="left")
         elif kind == "failed":
             ttk.Button(controls, text="Retry failed", command=self.retry_failed).pack(side="left")
-        else:
-            IconButton(
-                controls, "refresh", "Check for new files", command=self.rescan,
-            ).pack(side="left")
-            IconButton(
-                controls, "remove", "Remove channel", command=self.remove_channel,
-            ).pack(side="left", padx=(6, 0))
         IconButton(
             controls, "priority-up", "Raise selected files priority",
             command=lambda selected=kind: self.shift_selected_file_priority(selected, -1),
-        ).pack(side="left", padx=(6, 0))
+        ).pack(side="left", padx=(0 if kind == "queue" else 6, 0))
         IconButton(
             controls, "priority-down", "Lower selected files priority",
             command=lambda selected=kind: self.shift_selected_file_priority(selected, 1),
@@ -714,17 +1123,6 @@ class ChannelPanel(ttk.LabelFrame):
     @staticmethod
     def pages(count: int, page_size: int) -> int:
         return max(1, math.ceil(count / page_size))
-
-    def toggle_details(self) -> None:
-        self.collapsed = not self.collapsed
-        if self.collapsed:
-            self.notebook.pack_forget()
-            self.collapse_button.set_icon("expand", "Expand details")
-        else:
-            self.notebook.pack(fill="both", expand=True)
-            self.collapse_button.set_icon("collapse", "Collapse details")
-            self.table_revisions[self.selected_tab()] = -1
-        self.refresh(self.cached_positions)
 
     def selected_tab(self) -> str:
         selected_index = self.notebook.index(self.notebook.select())
@@ -810,12 +1208,6 @@ class ChannelPanel(ttk.LabelFrame):
             "Resume channel" if self.channel.paused else "Pause channel",
         )
         priority = priority_name(self.channel.priority_level)
-        self.channel_priority_marker.delete("all")
-        color = PRIORITY_COLORS[priority]
-        if color is not None:
-            self.channel_priority_marker.create_rectangle(
-                0, 0, 5, 16, fill=color, outline="",
-            )
         self.channel_priority_up_button.configure(
             state="disabled" if priority == "high" else "normal",
         )
@@ -830,13 +1222,7 @@ class ChannelPanel(ttk.LabelFrame):
             self.count_revision = revision
         counts = self.cached_counts
         title = f"{self.channel.title} (Paused)" if self.channel.paused else self.channel.title
-        if self.collapsed:
-            self.title_text.set(
-                f"{title}    Queue: {counts['queue']}    "
-                f"Downloaded: {counts['downloaded']}    Failed: {counts['failed']}"
-            )
-        else:
-            self.title_text.set(title)
+        self.title_text.set(title)
         minimum = f"{self.channel.min_duration_seconds // 60}:{self.channel.min_duration_seconds % 60:02d}"
         file_types = ", ".join(self.channel.media_types) if self.channel.media_types else "All file types"
         self.stats.set(
@@ -866,8 +1252,6 @@ class ChannelPanel(ttk.LabelFrame):
             self.progress_text.set("0%")
         for kind, count in counts.items():
             self.notebook.tab(self.tab_indexes[kind], text=f"{kind.capitalize()} ({count})")
-        if self.collapsed:
-            return
         kind = self.selected_tab()
         if self.table_revisions[kind] == revision:
             return
@@ -888,7 +1272,7 @@ class ChannelPanel(ttk.LabelFrame):
 
 
 class ConnectionPill(tk.Canvas):
-    """Compact connection indicator with a health dot and rounded background."""
+    """Supersampled connection pill with smooth curves and a health dot."""
 
     COLORS = {
         "connected": ("#e6f4ea", "#137333"),
@@ -897,50 +1281,148 @@ class ConnectionPill(tk.Canvas):
     }
 
     def __init__(self, parent: tk.Misc):
-        self.status_font = tkfont.Font(parent, family="Segoe UI", size=9, weight="bold")
-        background = parent.winfo_toplevel().cget("background")
         super().__init__(
-            parent, height=28, width=100, background=background,
+            parent, height=28, width=100, background=CONTENT_BACKGROUND,
             highlightthickness=0, borderwidth=0,
         )
+        self.rendered_image: Any = None
         self.set_status("Connecting…", "connecting")
 
     def set_status(self, text: str, state: str) -> None:
         background, foreground = self.COLORS[state]
-        label = f"●  {text}"
-        width = self.status_font.measure(label) + 22
+        scale = 4
         height = 28
-        radius = height // 2
+        try:
+            font = ImageFont.truetype("segoeuib.ttf", 12 * scale)
+        except OSError:
+            font = ImageFont.load_default(size=12 * scale)
+        measuring = Image.new("RGBA", (1, 1))
+        text_bounds = ImageDraw.Draw(measuring).textbbox((0, 0), text, font=font)
+        text_width = text_bounds[2] - text_bounds[0]
+        text_height = text_bounds[3] - text_bounds[1]
+        width = round(text_width / scale) + 38
+        rendered = Image.new("RGBA", (width * scale, height * scale), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(rendered)
+        inset = scale
+        draw.rounded_rectangle(
+            (inset, inset, width * scale - inset - 1, height * scale - inset - 1),
+            radius=(height // 2 - 1) * scale,
+            fill=background, outline=foreground, width=scale,
+        )
+        dot_x, dot_y, dot_radius = 13 * scale, height * scale // 2, 3 * scale
+        draw.ellipse(
+            (dot_x - dot_radius, dot_y - dot_radius, dot_x + dot_radius, dot_y + dot_radius),
+            fill=foreground,
+        )
+        text_x = 22 * scale
+        text_y = (height * scale - text_height) / 2 - text_bounds[1]
+        draw.text((text_x, text_y), text, fill=foreground, font=font)
+        rendered = rendered.resize((width, height), Image.Resampling.LANCZOS)
+        self.rendered_image = ImageTk.PhotoImage(rendered, master=self)
         self.configure(width=width, height=height)
         self.delete("all")
-        self.create_oval(1, 1, height - 1, height - 1, fill=background, outline="")
-        self.create_oval(width - height + 1, 1, width - 1, height - 1, fill=background, outline="")
-        self.create_rectangle(radius, 1, width - radius, height - 1, fill=background, outline="")
-        self.create_arc(
-            1, 1, height - 1, height - 1, start=90, extent=180,
-            style="arc", outline=foreground, width=1,
+        self.create_image(0, 0, image=self.rendered_image, anchor="nw")
+
+
+class SidebarChannelItem(tk.Frame):
+    """A compact navigation row for selecting the active channel workspace."""
+
+    def __init__(
+        self, parent: tk.Misc, channel_id: int, command: Any,
+        avatar_store: AvatarStore,
+    ):
+        super().__init__(parent, background=SIDEBAR_BACKGROUND, cursor="hand2")
+        self.channel_id = channel_id
+        self.command = command
+        self.avatar_store = avatar_store
+        self.priority = "medium"
+        self.selected = False
+        self.marker = tk.Frame(self, width=7, background=SIDEBAR_BACKGROUND)
+        self.marker.pack(side="left", fill="y")
+        self.avatar_label = tk.Label(
+            self, background=SIDEBAR_BACKGROUND, borderwidth=0,
         )
-        self.create_arc(
-            width - height + 1, 1, width - 1, height - 1, start=-90, extent=180,
-            style="arc", outline=foreground, width=1,
+        self.avatar_label.pack(side="left", padx=(10, 0))
+        self.text_area = tk.Frame(self, background=SIDEBAR_BACKGROUND)
+        self.text_area.pack(side="left", fill="both", expand=True, padx=(9, 8), pady=10)
+        self.title_row = tk.Frame(self.text_area, background=SIDEBAR_BACKGROUND)
+        self.title_row.pack(fill="x")
+        self.title_label = tk.Label(
+            self.title_row, anchor="w", background=SIDEBAR_BACKGROUND,
+            foreground=TEXT_COLOR, font=("Segoe UI Semibold", 10),
         )
-        self.create_line(radius, 1, width - radius, 1, fill=foreground, width=1)
-        self.create_line(radius, height - 1, width - radius, height - 1, fill=foreground, width=1)
-        self.create_text(width / 2, height / 2, text=label, fill=foreground, font=self.status_font)
+        self.title_label.pack(side="left")
+        self.active_indicator = ActiveDownloadIndicator(self.title_row)
+        self.detail_label = tk.Label(
+            self.text_area, anchor="w", background=SIDEBAR_BACKGROUND,
+            foreground=MUTED_TEXT, font=("Segoe UI", 8),
+        )
+        self.detail_label.pack(fill="x", pady=(2, 0))
+        for widget in (
+            self, self.marker, self.avatar_label, self.text_area, self.title_row,
+            self.title_label, self.active_indicator, self.detail_label,
+        ):
+            widget.bind("<Button-1>", self._activate, add="+")
+            widget.bind("<Enter>", self._hover_on, add="+")
+            widget.bind("<Leave>", self._hover_off, add="+")
+
+    def _activate(self, _event: Any = None) -> None:
+        self.command(self.channel_id)
+
+    def _hover_on(self, _event: Any = None) -> None:
+        if not self.selected:
+            self._paint("#e2e7ec", TEXT_COLOR, MUTED_TEXT)
+
+    def _hover_off(self, _event: Any = None) -> None:
+        self.set_selected(self.selected)
+
+    def _paint(self, background: str, title_color: str, detail_color: str) -> None:
+        self.configure(background=background)
+        self.avatar_label.configure(background=background)
+        self.text_area.configure(background=background)
+        self.title_row.configure(background=background)
+        self.title_label.configure(background=background, foreground=title_color)
+        self.active_indicator.set_background(background)
+        self.detail_label.configure(background=background, foreground=detail_color)
+        self.marker.configure(background=PRIORITY_COLORS[self.priority] or background)
+
+    def update_channel(self, channel: Channel, queued: int, downloading: bool) -> None:
+        self.priority = priority_name(channel.priority_level)
+        self.channel = channel
+        self.avatar_image = self.avatar_store.get(channel, 34)
+        self.avatar_label.configure(image=self.avatar_image)
+        self.title_label.configure(text=channel.title)
+        self.detail_label.configure(
+            text="Paused" if channel.paused else f"{queued:,} queued",
+        )
+        self.active_indicator.set_active(downloading)
+        self.set_selected(self.selected)
+
+    def set_selected(self, selected: bool) -> None:
+        self.selected = selected
+        if selected:
+            self._paint(ACCENT, "#ffffff", "#dceaff")
+        else:
+            self._paint(SIDEBAR_BACKGROUND, TEXT_COLOR, MUTED_TEXT)
 
 
 class DownloaderApp(tk.Tk):
     def __init__(self, config: Config, db: Database):
         super().__init__()
+        configure_application_theme(self)
         self.app_icon_images = apply_application_icon(self)
-        ttk.Style(self).configure("Icon.TButton", padding=(6, 5))
         self.icons = load_icons(self)
         self.db = db
+        self.avatar_store = AvatarStore(self, db.path.parent / "avatars")
         self.config = config
         self.events: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
         self.cards: dict[int, ChannelPanel] = {}
+        self.sidebar_items: dict[int, SidebarChannelItem] = {}
+        self.selected_channel_id: int | None = None
         self.add_channel_dialog: AddChannelDialog | None = None
         self.paused = False
+        self.authenticated = False
+        self.authentication_busy = True
         self.closing = False
         self.poll_job: str | None = None
         self.position_revision = -1
@@ -957,9 +1439,18 @@ class DownloaderApp(tk.Tk):
         self.engine.start()
 
     def build_toolbar(self) -> None:
-        toolbar = ttk.Frame(self, padding=8)
+        toolbar = ttk.Frame(self, padding=(16, 10), style="Topbar.TFrame")
+        self.toolbar = toolbar
         toolbar.pack(fill="x")
-        IconButton(toolbar, "add", "Add channel", command=self.add_channel).pack(side="left")
+        if self.app_icon_images:
+            ttk.Label(
+                toolbar, image=self.app_icon_images[-1], style="Topbar.TLabel",
+            ).pack(side="left", padx=(0, 9))
+        ttk.Label(
+            toolbar, text="Telegram Downloader", style="Brand.TLabel",
+        ).pack(side="left", padx=(0, 22))
+        self.add_button = IconButton(toolbar, "add", "Add channel", command=self.add_channel)
+        self.add_button.pack(side="left")
         self.pause_button = IconButton(
             toolbar, "pause", "Pause downloads", command=self.toggle_pause,
         )
@@ -967,7 +1458,7 @@ class DownloaderApp(tk.Tk):
         IconButton(
             toolbar, "settings", "Settings", command=self.open_settings,
         ).pack(side="left", padx=(6, 0))
-        ttk.Label(toolbar, text="Speed limit:").pack(side="left", padx=(18, 5))
+        ttk.Label(toolbar, text="Speed limit", style="Topbar.TLabel").pack(side="left", padx=(18, 6))
         self.speed = ttk.Combobox(
             toolbar, width=13, values=("Unlimited", "128 KB/s", "256 KB/s", "500 KB/s", "1024 KB/s", "2048 KB/s"),
         )
@@ -978,39 +1469,133 @@ class DownloaderApp(tk.Tk):
         self.speed.bind("<Return>", self.apply_speed)
         self.connection = ConnectionPill(toolbar)
         self.connection.pack(side="right")
+        self.auth_button = ttk.Button(
+            toolbar, text="Sign in", command=self.toggle_authentication, state="disabled",
+        )
+        self.auth_button.pack(side="right", padx=(6, 10))
+        self.account_status = tk.StringVar(value="Checking account…")
+        ttk.Label(toolbar, textvariable=self.account_status, style="Topbar.TLabel").pack(side="right")
         self.error_message = tk.StringVar()
         self.error_banner = ttk.Label(
-            self, textvariable=self.error_message, foreground="#a00000", padding=(10, 3),
-            wraplength=1150,
+            self, textvariable=self.error_message, padding=(16, 7),
+            wraplength=1150, style="Error.TLabel",
         )
-        self.error_banner.pack(fill="x")
+        self.error_message.trace_add("write", self._update_error_banner)
+
+    def _update_error_banner(self, *_args: Any) -> None:
+        if self.error_message.get().strip():
+            if not self.error_banner.winfo_manager():
+                self.error_banner.pack(fill="x", after=self.toolbar)
+        elif self.error_banner.winfo_manager():
+            self.error_banner.pack_forget()
 
     def build_scroller(self) -> None:
-        container = ttk.Frame(self)
+        container = ttk.Frame(self, style="App.TFrame")
         container.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(container, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
-        self.body = ttk.Frame(self.canvas, padding=(10, 4, 10, 10))
-        self.body_window = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
-        self.body.bind("<Configure>", lambda _event: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>", lambda event: self.canvas.itemconfigure(self.body_window, width=event.width))
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        self.canvas.bind_all("<MouseWheel>", lambda event: self.canvas.yview_scroll(int(-event.delta / 120), "units"))
+        sidebar = ttk.Frame(container, width=248, style="Sidebar.TFrame")
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+        sidebar_heading = ttk.Frame(sidebar, padding=(16, 17, 12, 8), style="Sidebar.TFrame")
+        sidebar_heading.pack(fill="x")
+        ttk.Label(
+            sidebar_heading, text="CHANNELS", style="SidebarTitle.TLabel",
+        ).pack(side="left")
+        self.channel_count = ttk.Label(
+            sidebar_heading, text="0", style="SidebarTitle.TLabel",
+        )
+        self.channel_count.pack(side="right")
+        self.sidebar_canvas = tk.Canvas(
+            sidebar, background=SIDEBAR_BACKGROUND, highlightthickness=0, borderwidth=0,
+        )
+        sidebar_scrollbar = ttk.Scrollbar(
+            sidebar, orient="vertical", command=self.sidebar_canvas.yview,
+        )
+        self.sidebar_list = tk.Frame(self.sidebar_canvas, background=SIDEBAR_BACKGROUND)
+        self.sidebar_window = self.sidebar_canvas.create_window(
+            (0, 0), window=self.sidebar_list, anchor="nw",
+        )
+        self.sidebar_list.bind(
+            "<Configure>",
+            lambda _event: self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all")),
+        )
+        self.sidebar_canvas.bind(
+            "<Configure>",
+            lambda event: self.sidebar_canvas.itemconfigure(self.sidebar_window, width=event.width),
+        )
+        self.sidebar_canvas.configure(yscrollcommand=sidebar_scrollbar.set)
+        self.sidebar_canvas.pack(side="left", fill="both", expand=True)
+        sidebar_scrollbar.pack(side="right", fill="y")
+
+        tk.Frame(container, width=1, background=BORDER_COLOR).pack(side="left", fill="y")
+        self.body = ttk.Frame(container, style="Content.TFrame")
+        self.body.pack(side="left", fill="both", expand=True)
+        self.empty_state = ttk.Frame(self.body, padding=40, style="Content.TFrame")
+        ttk.Label(
+            self.empty_state, text="No channels yet", style="ChannelTitle.TLabel",
+        ).pack(pady=(0, 7))
+        ttk.Label(
+            self.empty_state,
+            text="Add a Telegram channel to inspect its files and begin downloading.",
+            style="Muted.TLabel",
+        ).pack(pady=(0, 18))
+        ttk.Button(
+            self.empty_state, text="Add channel", command=self.add_channel,
+            style="Primary.TButton",
+        ).pack()
 
     def sync_cards(self) -> None:
-        enabled_channels = {channel.id: channel for channel in self.db.channels(True)}
+        channels = self.db.channels(True)
+        enabled_channels = {channel.id: channel for channel in channels}
         for channel_id in list(self.cards):
             if channel_id not in enabled_channels:
                 self.cards.pop(channel_id).destroy()
+                item = self.sidebar_items.pop(channel_id, None)
+                if item is not None:
+                    item.destroy()
         for channel in enabled_channels.values():
             if channel.id not in self.cards:
-                card = ChannelPanel(self.body, channel, self.db, self.engine)
-                card.pack(fill="x", expand=True, pady=(0, 10))
+                card = ChannelPanel(
+                    self.body, channel, self.db, self.engine, self.avatar_store,
+                )
                 self.cards[channel.id] = card
+                item = SidebarChannelItem(
+                    self.sidebar_list, channel.id, self.select_channel, self.avatar_store,
+                )
+                item.pack(fill="x", padx=8, pady=2)
+                self.sidebar_items[channel.id] = item
             else:
                 self.cards[channel.id].channel = channel
+                self.cards[channel.id].set_avatar()
+            self.sidebar_items[channel.id].update_channel(
+                channel, self.db.queue_count(channel.id),
+                self.db.active_download(channel.id) is not None,
+            )
+        self.channel_count.configure(text=str(len(channels)))
+        if self.selected_channel_id not in enabled_channels:
+            self.selected_channel_id = channels[0].id if channels else None
+        self._show_selected_channel()
+
+    def select_channel(self, channel_id: int) -> None:
+        if channel_id not in self.cards:
+            return
+        self.selected_channel_id = channel_id
+        self._show_selected_channel()
+        self.cards[channel_id].refresh(self.cached_positions)
+
+    def _show_selected_channel(self) -> None:
+        for channel_id, card in self.cards.items():
+            if channel_id == self.selected_channel_id:
+                if not card.winfo_manager():
+                    card.pack(fill="both", expand=True)
+            elif card.winfo_manager():
+                card.pack_forget()
+        for channel_id, item in self.sidebar_items.items():
+            item.set_selected(channel_id == self.selected_channel_id)
+        if self.selected_channel_id is None:
+            if not self.empty_state.winfo_manager():
+                self.empty_state.place(relx=0.5, rely=0.42, anchor="center")
+        else:
+            self.empty_state.place_forget()
 
     def add_channel(self) -> None:
         if self.add_channel_dialog is not None and self.add_channel_dialog.winfo_exists():
@@ -1045,9 +1630,84 @@ class DownloaderApp(tk.Tk):
         else:
             self.pause_button.set_icon("pause", "Pause downloads")
 
+    def toggle_authentication(self) -> None:
+        if self.authentication_busy:
+            return
+        if self.authenticated:
+            if not messagebox.askyesno(
+                "Sign out",
+                "Sign out of Telegram on this computer?\n\n"
+                "Active downloads will stop and remain queued. Your channel history and files will remain.",
+                parent=self,
+            ):
+                return
+            self._set_authentication_ui("signing_out")
+            if not self.engine.command("sign_out"):
+                self._authentication_command_failed()
+            return
+        phone = simpledialog.askstring(
+            "Sign in to Telegram",
+            "Enter your phone number in international format, for example +15551234567:",
+            parent=self,
+        )
+        if phone is None:
+            return
+        self._set_authentication_ui("signing_in")
+        if not self.engine.command("request_sign_in", phone=phone):
+            self._authentication_command_failed()
+
+    def _prompt_sign_in_code(self) -> None:
+        code = simpledialog.askstring(
+            "Telegram verification code",
+            "Enter the login code Telegram sent to your account:",
+            parent=self,
+        )
+        if code is None:
+            self.engine.command("cancel_sign_in")
+            return
+        if not self.engine.command("submit_sign_in_code", code=code):
+            self._authentication_command_failed()
+
+    def _prompt_sign_in_password(self) -> None:
+        password = simpledialog.askstring(
+            "Telegram two-step verification",
+            "Enter your Telegram two-step verification password:",
+            show="*", parent=self,
+        )
+        if password is None:
+            self.engine.command("cancel_sign_in")
+            return
+        if not self.engine.command("submit_sign_in_password", password=password):
+            self._authentication_command_failed()
+
+    def _authentication_command_failed(self) -> None:
+        self._set_authentication_ui("signed_out")
+        self.error_message.set("The Telegram worker is not ready. Try again or restart the application.")
+
+    def _set_authentication_ui(self, status: str, account: str = "") -> None:
+        self.authenticated = status == "signed_in"
+        self.authentication_busy = status in {"starting", "signing_in", "signing_out"}
+        self.auth_button.configure(
+            text="Sign out" if self.authenticated else "Sign in",
+            state="disabled" if self.authentication_busy else "normal",
+        )
+        self.add_button.configure(state="normal" if self.authenticated else "disabled")
+        self.pause_button.configure(state="normal" if self.authenticated else "disabled")
+        if status == "signed_in":
+            self.account_status.set(f"Signed in as {account}" if account else "Signed in")
+        elif status == "signing_in":
+            self.account_status.set("Signing in…")
+        elif status == "signing_out":
+            self.account_status.set("Signing out…")
+        elif status == "starting":
+            self.account_status.set("Checking account…")
+        else:
+            self.account_status.set("Signed out")
+
     def handle_event(self, event: str, data: dict[str, Any]) -> None:
         if event == "fatal":
             self.connection.set_status("Not connected", "disconnected")
+            self._set_authentication_ui("signed_out")
             self.error_message.set(
                 f"Downloader stopped: {data.get('error', 'Unknown error')}  "
                 "Change Settings if needed, then restart the application."
@@ -1063,10 +1723,42 @@ class DownloaderApp(tk.Tk):
                 self.connection.set_status("Connecting…", "connecting")
             else:
                 self.connection.set_status("Disconnected", "disconnected")
+        elif event == "authentication":
+            status = str(data.get("status", "signed_out"))
+            username = str(data.get("username", "") or "")
+            display_name = str(data.get("display_name", "") or "")
+            account = f"@{username}" if username else display_name
+            self._set_authentication_ui(status, account)
+            if status == "signed_in":
+                self.error_message.set("")
+        elif event == "authentication_code_requested":
+            self._prompt_sign_in_code()
+        elif event == "authentication_password_required":
+            self._prompt_sign_in_password()
+        elif event == "authentication_error":
+            if str(data.get("stage", "")) not in {"sign_out", "already_signed_in"}:
+                self._set_authentication_ui("signed_out")
+            messagebox.showerror(
+                "Telegram authentication",
+                str(data.get("error", "Authentication failed.")),
+                parent=self,
+            )
         elif event == "channel_added":
             self.sync_cards()
         elif event == "channel_removed":
             self.sync_cards()
+        elif event == "avatar_ready":
+            channel_id = int(data.get("channel_id", 0) or 0)
+            self.avatar_store.invalidate(channel_id)
+            card = self.cards.get(channel_id)
+            item = self.sidebar_items.get(channel_id)
+            if card is not None:
+                card.set_avatar()
+            if item is not None and hasattr(item, "channel"):
+                item.update_channel(
+                    item.channel, self.db.queue_count(channel_id),
+                    self.db.active_download(channel_id) is not None,
+                )
         elif event == "channel_types":
             dialog = self.add_channel_dialog
             if dialog is not None and dialog.winfo_exists():
@@ -1086,8 +1778,8 @@ class DownloaderApp(tk.Tk):
         if revision != self.position_revision:
             self.cached_positions = self.db.queue_positions()
             self.position_revision = revision
-        for card in self.cards.values():
-            card.refresh(self.cached_positions)
+        if self.selected_channel_id in self.cards:
+            self.cards[self.selected_channel_id].refresh(self.cached_positions)
         self.poll_job = self.after(1000, self.poll)
 
     def close(self) -> None:

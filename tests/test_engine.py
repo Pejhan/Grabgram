@@ -153,6 +153,113 @@ class ConnectionStatusTests(unittest.TestCase):
         )
 
 
+class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        root = Path(self.temporary_directory.name)
+        self.db = Database(root / "test.sqlite3")
+        self.events = []
+        self.engine = DownloaderEngine(
+            Config(1, "hash", root / "session", self.db.path, root / "downloads"),
+            self.db, lambda event, data: self.events.append((event, data)),
+        )
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    async def test_phone_request_prompts_for_code(self) -> None:
+        client = SimpleNamespace(
+            is_user_authorized=AsyncMock(return_value=False),
+            send_code_request=AsyncMock(
+                return_value=SimpleNamespace(phone_code_hash="code-hash")
+            )
+        )
+        self.engine._client = client
+        self.engine._ensure_client_connected = AsyncMock()
+
+        await self.engine._request_sign_in(" +15551234567 ")
+
+        client.send_code_request.assert_awaited_once_with("+15551234567")
+        self.assertEqual("+15551234567", self.engine._auth_phone)
+        self.assertEqual("code-hash", self.engine._auth_phone_code_hash)
+        self.assertEqual(("authentication_code_requested", {}), self.events[-1])
+
+    async def test_code_can_continue_to_two_step_password(self) -> None:
+        SessionPasswordNeededError = type("SessionPasswordNeededError", (Exception,), {})
+        client = SimpleNamespace(sign_in=AsyncMock(side_effect=SessionPasswordNeededError()))
+        self.engine._client = client
+        self.engine._auth_phone = "+15551234567"
+        self.engine._auth_phone_code_hash = "code-hash"
+
+        await self.engine._submit_sign_in_code("12345")
+
+        client.sign_in.assert_awaited_once_with(
+            phone="+15551234567", code="12345", phone_code_hash="code-hash",
+        )
+        self.assertEqual(("authentication_password_required", {}), self.events[-1])
+
+    async def test_successful_password_activates_session(self) -> None:
+        self.engine._client = SimpleNamespace(sign_in=AsyncMock())
+        self.engine._activate_authenticated_session = AsyncMock()
+
+        await self.engine._submit_sign_in_password("secret password")
+
+        self.engine._client.sign_in.assert_awaited_once_with(password="secret password")
+        self.engine._activate_authenticated_session.assert_awaited_once_with()
+
+    async def test_session_activation_works_without_saved_channels(self) -> None:
+        self.engine._client = SimpleNamespace(
+            get_me=AsyncMock(
+                return_value=SimpleNamespace(
+                    first_name="Sample", last_name="User", username="sample_user",
+                )
+            ),
+            remove_event_handler=Mock(),
+        )
+        self.engine._running = asyncio.Event()
+        self.engine._running.set()
+
+        await self.engine._activate_authenticated_session()
+
+        self.assertTrue(self.engine._authenticated)
+        self.assertEqual(
+            (
+                "authentication",
+                {
+                    "status": "signed_in", "display_name": "Sample User",
+                    "username": "sample_user",
+                },
+            ),
+            self.events[-2],
+        )
+        await self.engine._deactivate_authenticated_session()
+        self.assertFalse(self.engine._authenticated)
+
+    async def test_second_account_requires_sign_out_first(self) -> None:
+        client = SimpleNamespace(send_code_request=AsyncMock())
+        self.engine._client = client
+        self.engine._authenticated = True
+
+        await self.engine._request_sign_in("+15551234567")
+
+        client.send_code_request.assert_not_awaited()
+        self.assertEqual("authentication_error", self.events[-1][0])
+        self.assertIn("Sign out", self.events[-1][1]["error"])
+
+    async def test_sign_out_invalidates_client_and_returns_to_signed_out_state(self) -> None:
+        client = SimpleNamespace(log_out=AsyncMock())
+        self.engine._client = client
+        self.engine._authenticated = True
+        self.engine._deactivate_authenticated_session = AsyncMock()
+
+        await self.engine._sign_out()
+
+        self.engine._deactivate_authenticated_session.assert_awaited_once_with()
+        client.log_out.assert_awaited_once_with()
+        self.assertIsNone(self.engine._client)
+        self.assertEqual(("authentication", {"status": "signed_out"}), self.events[-1])
+
+
 class ChannelPauseTests(unittest.IsolatedAsyncioTestCase):
     async def test_channel_waits_until_resumed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

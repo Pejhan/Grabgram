@@ -80,8 +80,15 @@ class DownloaderEngine:
         self._running: asyncio.Event | None = None
         self._stopping = False
         self._client: Any = None
+        self._client_factory: Any = None
+        self._connection_module: Any = None
+        self._new_message_event: Any = None
         self._connection_status: str | None = None
         self._mtproto_proxy_enabled = False
+        self._authenticated = False
+        self._authorized_tasks: set[asyncio.Task[Any]] = set()
+        self._auth_phone = ""
+        self._auth_phone_code_hash = ""
         self._active_download_task: asyncio.Task[None] | None = None
         self._active_media_id: int | None = None
         self._active_channel_id: int | None = None
@@ -172,40 +179,190 @@ class DownloaderEngine:
         self._commands = asyncio.Queue()
         self._running = asyncio.Event()
         self._running.set()
+        self._client_factory = TelegramClient
+        self._connection_module = connection
+        self._new_message_event = events.NewMessage
         mtproxy = load_mtproto_proxy(self.db)
         self._mtproto_proxy_enabled = mtproxy.enabled
-        self._client = TelegramClient(
-            str(self.config.session_file), self.config.api_id, self.config.api_hash,
-            **telethon_client_options(mtproxy, connection),
-        )
-        self._set_connection_status("connecting")
-        await self._client.connect()
-        if not await self._client.is_user_authorized():
-            self._emit("fatal", error="Telegram session is not authorized. Close the app and run: python -m tg_downloader.auth")
-            await self._client.disconnect()
-            return
+        await self._ensure_client_connected()
+        if await self._client.is_user_authorized():
+            await self._activate_authenticated_session()
+        else:
+            self._emit("authentication", status="signed_out")
 
-        self._client.add_event_handler(self._on_new_message, events.NewMessage())
-        self._set_connection_status("connected")
-        self._emit("state", paused=False)
-
-        scans = [asyncio.create_task(self._scan_channel(channel, full=True)) for channel in self.db.channels(True)]
-        avatars = [asyncio.create_task(self._cache_avatar(channel)) for channel in self.db.channels(True)]
-        tasks = scans + avatars + [
-            asyncio.create_task(self._download_loop()),
+        base_tasks = [
             asyncio.create_task(self._command_loop()),
-            asyncio.create_task(self._periodic_scan()),
             asyncio.create_task(self._connection_monitor()),
         ]
         try:
             while not self._stopping:
                 await asyncio.sleep(0.25)
         finally:
-            for task in tasks:
+            await self._deactivate_authenticated_session()
+            for task in base_tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await self._client.disconnect()
+            await asyncio.gather(*base_tasks, return_exceptions=True)
+            if self._client is not None and self._client.is_connected():
+                await self._client.disconnect()
             self._set_connection_status("disconnected")
+
+    async def _ensure_client_connected(self) -> None:
+        if self._client is None:
+            if self._client_factory is None or self._connection_module is None:
+                raise RuntimeError("Telegram client is not ready")
+            mtproxy = load_mtproto_proxy(self.db)
+            self._client = self._client_factory(
+                str(self.config.session_file), self.config.api_id, self.config.api_hash,
+                **telethon_client_options(mtproxy, self._connection_module),
+            )
+        if not self._client.is_connected():
+            self._set_connection_status("connecting")
+            await self._client.connect()
+        self._set_connection_status("connected")
+
+    def _track_authenticated_task(self, coroutine: Any) -> None:
+        task = asyncio.create_task(coroutine)
+        self._authorized_tasks.add(task)
+        task.add_done_callback(self._authorized_tasks.discard)
+
+    async def _activate_authenticated_session(self) -> None:
+        if self._authenticated:
+            return
+        user = await self._client.get_me()
+        self._authenticated = True
+        self._auth_phone = ""
+        self._auth_phone_code_hash = ""
+        if self._new_message_event is not None:
+            self._client.add_event_handler(self._on_new_message, self._new_message_event())
+        for channel in self.db.channels(True):
+            self._track_authenticated_task(self._scan_channel(channel, full=True))
+            self._track_authenticated_task(self._cache_avatar(channel))
+        self._track_authenticated_task(self._download_loop())
+        self._track_authenticated_task(self._periodic_scan())
+        first_name = str(getattr(user, "first_name", "") or "").strip()
+        last_name = str(getattr(user, "last_name", "") or "").strip()
+        username = str(getattr(user, "username", "") or "").strip()
+        display_name = " ".join(part for part in (first_name, last_name) if part)
+        self._emit(
+            "authentication", status="signed_in", display_name=display_name,
+            username=username,
+        )
+        self._emit("state", paused=not self._running.is_set())
+
+    async def _deactivate_authenticated_session(self) -> None:
+        if not self._authenticated and not self._authorized_tasks:
+            return
+        self._authenticated = False
+        if self._client is not None:
+            try:
+                self._client.remove_event_handler(self._on_new_message)
+            except (AttributeError, ValueError):
+                pass
+        tasks = list(self._authorized_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._authorized_tasks.clear()
+
+    async def _request_sign_in(self, phone: str) -> None:
+        if self._authenticated:
+            self._emit(
+                "authentication_error", stage="already_signed_in",
+                error="Sign out before signing in with another account.",
+            )
+            return
+        if self._auth_phone:
+            self._emit(
+                "authentication_error", stage="phone",
+                error="A sign-in attempt is already in progress.",
+            )
+            return
+        phone = phone.strip()
+        if not phone:
+            self._emit("authentication_error", stage="phone", error="Enter your phone number.")
+            return
+        self._emit("authentication", status="signing_in")
+        try:
+            await self._ensure_client_connected()
+            if await self._client.is_user_authorized():
+                await self._activate_authenticated_session()
+                return
+            sent = await self._client.send_code_request(phone)
+            self._auth_phone = phone
+            self._auth_phone_code_hash = str(getattr(sent, "phone_code_hash", "") or "")
+            self._emit("authentication_code_requested")
+        except Exception as exc:
+            self._clear_pending_authentication()
+            self._emit_authentication_error("phone", exc)
+
+    async def _submit_sign_in_code(self, code: str) -> None:
+        if not self._auth_phone:
+            self._emit(
+                "authentication_error", stage="code",
+                error="The sign-in request expired. Start again.",
+            )
+            return
+        try:
+            await self._client.sign_in(
+                phone=self._auth_phone, code=code.strip(),
+                phone_code_hash=self._auth_phone_code_hash or None,
+            )
+        except Exception as exc:
+            if type(exc).__name__ == "SessionPasswordNeededError":
+                self._emit("authentication_password_required")
+                return
+            self._clear_pending_authentication()
+            self._emit_authentication_error("code", exc)
+            return
+        try:
+            await self._activate_authenticated_session()
+        except Exception as exc:
+            self._emit_authentication_error("session", exc)
+
+    async def _submit_sign_in_password(self, password: str) -> None:
+        try:
+            await self._client.sign_in(password=password)
+        except Exception as exc:
+            self._clear_pending_authentication()
+            self._emit_authentication_error("password", exc)
+            return
+        try:
+            await self._activate_authenticated_session()
+        except Exception as exc:
+            self._emit_authentication_error("session", exc)
+
+    async def _sign_out(self) -> None:
+        if not self._authenticated or self._client is None:
+            self._emit("authentication", status="signed_out")
+            return
+        self._emit("authentication", status="signing_out")
+        await self._deactivate_authenticated_session()
+        try:
+            await self._client.log_out()
+        except Exception as exc:
+            try:
+                still_authorized = await self._client.is_user_authorized()
+            except Exception:
+                still_authorized = False
+            if still_authorized:
+                await self._activate_authenticated_session()
+            self._emit_authentication_error("sign_out", exc)
+            return
+        self._client = None
+        self._clear_pending_authentication()
+        self._set_connection_status("disconnected")
+        self._emit("authentication", status="signed_out")
+
+    def _clear_pending_authentication(self) -> None:
+        self._auth_phone = ""
+        self._auth_phone_code_hash = ""
+
+    def _emit_authentication_error(self, stage: str, exc: BaseException) -> None:
+        self._emit(
+            "authentication_error", stage=stage,
+            error=f"{type(exc).__name__}: {exc}",
+        )
 
     async def _connection_monitor(self) -> None:
         """Reflect Telethon reconnects without confusing operation failures with transport health."""
@@ -216,7 +373,9 @@ class DownloaderEngine:
                 connected = bool(client is not None and client.is_connected())
             except Exception:
                 connected = False
-            self._set_connection_status("connected" if connected else "connecting")
+            self._set_connection_status(
+                "connected" if connected else "disconnected" if client is None else "connecting"
+            )
 
     async def _command_loop(self) -> None:
         assert self._commands is not None
@@ -224,14 +383,32 @@ class DownloaderEngine:
             name, data = await self._commands.get()
             if name == "stop":
                 self._stopping = True
+            elif name == "request_sign_in":
+                await self._request_sign_in(**data)
+            elif name == "submit_sign_in_code":
+                await self._submit_sign_in_code(**data)
+            elif name == "submit_sign_in_password":
+                await self._submit_sign_in_password(**data)
+            elif name == "cancel_sign_in":
+                self._clear_pending_authentication()
+                self._emit("authentication", status="signed_out")
+            elif name == "sign_out":
+                await self._sign_out()
             elif name == "add_channel":
-                await self._add_channel(**data)
+                if self._authenticated:
+                    await self._add_channel(**data)
+                else:
+                    self._emit("error", error="Sign in before adding a channel.")
             elif name == "inspect_channel_types":
-                asyncio.create_task(self._inspect_channel_types(**data))
+                if self._authenticated:
+                    self._track_authenticated_task(self._inspect_channel_types(**data))
+                else:
+                    self._emit("error", error="Sign in before inspecting a channel.")
             elif name == "rescan":
-                channel = next((c for c in self.db.channels() if c.id == data["channel_id"]), None)
-                if channel:
-                    asyncio.create_task(self._scan_channel(channel, full=False))
+                if self._authenticated:
+                    channel = next((c for c in self.db.channels() if c.id == data["channel_id"]), None)
+                    if channel:
+                        self._track_authenticated_task(self._scan_channel(channel, full=False))
             elif name == "set_speed_limit":
                 bytes_per_second = max(0, int(data["bytes_per_second"]))
                 self._limiter.set_rate(bytes_per_second)
@@ -291,8 +468,8 @@ class DownloaderEngine:
             self._paused_channel_ids.discard(channel_id)
             channel = next(c for c in self.db.channels() if c.id == channel_id)
             self._emit("channel_added", channel_id=channel_id)
-            asyncio.create_task(self._scan_channel(channel, full=True))
-            asyncio.create_task(self._cache_avatar(channel))
+            self._track_authenticated_task(self._scan_channel(channel, full=True))
+            self._track_authenticated_task(self._cache_avatar(channel))
         except Exception as exc:
             self._emit("error", error=f"Could not add {identifier}: {type(exc).__name__}: {exc}")
 
