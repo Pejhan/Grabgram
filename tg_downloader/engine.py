@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+import re
 import threading
 import time
 from collections import Counter
@@ -448,7 +449,22 @@ class DownloaderEngine:
         try:
             entity = await self._client.get_entity(identifier)
             title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
-            folder = folder.strip() or str(getattr(entity, "username", None) or entity.id)
+            folder_source = getattr(entity, "username", None) or title or entity.id
+            folder_prefix = re.sub(
+                r"[^A-Za-z0-9_.-]+", "_", str(folder_source).strip().lstrip("@"),
+            ).strip("._") or str(entity.id)
+            folder = folder.strip() or folder_prefix
+            normalized_folder = folder.casefold()
+            normalized_prefix = folder_prefix.casefold()
+            if normalized_folder != normalized_prefix and not normalized_folder.startswith(
+                f"{normalized_prefix}_"
+            ):
+                raise ValueError(
+                    f'Download folder must be "{folder_prefix}" or start with '
+                    f'"{folder_prefix}_"'
+                )
+            if Path(folder).name != folder or "/" in folder or "\\" in folder:
+                raise ValueError("Download folder must be a single folder name")
             self._folder_path(folder)
             channel_id = self.db.add_channel(
                 identifier, int(entity.id), title, folder, min_duration_seconds, min_size_bytes,
@@ -475,12 +491,25 @@ class DownloaderEngine:
 
     async def _inspect_channel_types(self, identifier: str, request_id: str) -> None:
         try:
+            self._emit(
+                "channel_types_progress", request_id=request_id, files_fetched=0,
+            )
             entity = await self._client.get_entity(identifier)
             counts: Counter[str] = Counter()
+            files_fetched = 0
+            last_progress_at = time.monotonic()
             async for message in self._client.iter_messages(entity):
                 info = self._media_info(message)
                 if info is not None:
                     counts[Path(info.filename).suffix.lower() or ".file"] += 1
+                    files_fetched += 1
+                    now = time.monotonic()
+                    if files_fetched == 1 or now - last_progress_at >= 0.25:
+                        self._emit(
+                            "channel_types_progress", request_id=request_id,
+                            files_fetched=files_fetched,
+                        )
+                        last_progress_at = now
                 await asyncio.sleep(0)
             file_types = [
                 {"extension": extension, "count": count}
@@ -489,6 +518,13 @@ class DownloaderEngine:
             self._emit(
                 "channel_types", request_id=request_id,
                 username=str(getattr(entity, "username", None) or ""),
+                folder_prefix=re.sub(
+                    r"[^A-Za-z0-9_.-]+", "_",
+                    str(
+                        getattr(entity, "username", None)
+                        or getattr(entity, "title", None) or entity.id
+                    ).strip().lstrip("@"),
+                ).strip("._") or str(entity.id),
                 file_types=file_types,
             )
         except Exception as exc:

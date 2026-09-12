@@ -79,12 +79,44 @@ class MediaDiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
             engine._client = Client()
             await engine._inspect_channel_types("sample", "request-1")
+            progress = [
+                data["files_fetched"] for event, data in events
+                if event == "channel_types_progress"
+            ]
+            self.assertEqual(0, progress[0])
+            self.assertIn(1, progress)
             payload = events[-1][1]
             self.assertEqual("sample_channel", payload["username"])
             self.assertEqual(
                 [(".mp4", 3), (".jpg", 2), (".pdf", 1)],
                 [(item["extension"], item["count"]) for item in payload["file_types"]],
             )
+
+    async def test_channel_folder_accepts_only_resolved_name_and_underscore_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = Database(root / "test.sqlite3")
+            events = []
+            engine = DownloaderEngine(
+                Config(1, "hash", root / "session", db.path, root / "downloads"),
+                db, lambda event, data: events.append((event, data)),
+            )
+
+            class Client:
+                async def get_entity(self, _identifier):
+                    return SimpleNamespace(id=123, username="sample_channel", title="Sample")
+
+            engine._client = Client()
+            await engine._add_channel("sample", "unrelated", 0, 0)
+            self.assertFalse(db.channels())
+            self.assertIn("sample_channel_", events[-1][1]["error"])
+
+            with patch.object(
+                engine, "_track_authenticated_task",
+                side_effect=lambda coroutine: coroutine.close(),
+            ):
+                await engine._add_channel("sample", "sample_channel_audio", 0, 0)
+            self.assertEqual("sample_channel_audio", db.channels()[0].folder)
 
 
 class BandwidthLimiterTests(unittest.IsolatedAsyncioTestCase):

@@ -412,6 +412,7 @@ class AddChannelDialog(tk.Toplevel):
         self.selected_file_types: tuple[str, ...] = ()
         self.available_file_types: list[tuple[str, int]] = []
         self.inspect_request_id: str | None = None
+        self.folder_prefix = ""
         self.folder_edited = False
         self.setting_folder = False
 
@@ -454,8 +455,9 @@ class AddChannelDialog(tk.Toplevel):
     def _identifier_changed(self, *_args: Any) -> None:
         if self.folder_edited:
             return
+        self.folder_prefix = suggested_channel_folder(self.identifier.get())
         self.setting_folder = True
-        self.folder.set(suggested_channel_folder(self.identifier.get()))
+        self.folder.set(self.folder_prefix)
         self.setting_folder = False
 
     def _folder_changed(self, *_args: Any) -> None:
@@ -476,6 +478,13 @@ class AddChannelDialog(tk.Toplevel):
             self.file_types_text.set("All file types")
             messagebox.showwarning("Not connected", "The downloader is not connected yet.", parent=self)
 
+    def receive_file_type_progress(self, data: dict[str, Any]) -> None:
+        if data.get("request_id") != self.inspect_request_id:
+            return
+        count = max(0, int(data.get("files_fetched", 0)))
+        noun = "file" if count == 1 else "files"
+        self.file_types_text.set(f"Scanning channel… {count:,} {noun} fetched")
+
     def receive_file_types(self, data: dict[str, Any]) -> None:
         if data.get("request_id") != self.inspect_request_id:
             return
@@ -485,11 +494,21 @@ class AddChannelDialog(tk.Toplevel):
             self.file_types_text.set("All file types" if not self.selected_file_types else ", ".join(self.selected_file_types))
             messagebox.showwarning("File type scan failed", str(data["error"]), parent=self)
             return
-        username = str(data.get("username", "")).strip()
-        if username and not self.folder_edited:
-            self.setting_folder = True
-            self.folder.set(username)
-            self.setting_folder = False
+        folder_prefix = str(data.get("folder_prefix") or data.get("username") or "").strip()
+        if folder_prefix:
+            old_prefix = self.folder_prefix
+            self.folder_prefix = folder_prefix
+            if not self.folder_edited:
+                self.setting_folder = True
+                self.folder.set(folder_prefix)
+                self.setting_folder = False
+            elif old_prefix and self.folder.get().casefold().startswith(
+                f"{old_prefix.casefold()}_"
+            ):
+                suffix = self.folder.get()[len(old_prefix):]
+                self.setting_folder = True
+                self.folder.set(f"{folder_prefix}{suffix}")
+                self.setting_folder = False
         self.available_file_types = [
             (str(item["extension"]), int(item["count"])) for item in data.get("file_types", [])
         ]
@@ -516,9 +535,23 @@ class AddChannelDialog(tk.Toplevel):
         except ValueError:
             messagebox.showwarning("Invalid minimum", "Minimum length and size must be numbers.", parent=self)
             return
+        folder = self.folder.get().strip()
+        if self.folder_prefix:
+            normalized_folder = folder.casefold()
+            normalized_prefix = self.folder_prefix.casefold()
+            if normalized_folder != normalized_prefix and not normalized_folder.startswith(
+                f"{normalized_prefix}_"
+            ):
+                messagebox.showwarning(
+                    "Invalid download folder",
+                    f'The folder must be "{self.folder_prefix}" or start with '
+                    f'"{self.folder_prefix}_".',
+                    parent=self,
+                )
+                return
         # Let the engine use Telegram's resolved username unless the user chose
         # a custom folder (for example, by appending "_audio" or "_video").
-        folder = self.folder.get().strip() if self.folder_edited else ""
+        folder = folder if self.folder_edited else ""
         self.engine.command(
             "add_channel", identifier=identifier, folder=folder,
             min_duration_seconds=duration, min_size_bytes=size,
@@ -1820,6 +1853,10 @@ class DownloaderApp(tk.Tk):
                     item.channel, self.db.queue_count(channel_id),
                     self.db.active_download(channel_id) is not None,
                 )
+        elif event == "channel_types_progress":
+            dialog = self.add_channel_dialog
+            if dialog is not None and dialog.winfo_exists():
+                dialog.receive_file_type_progress(data)
         elif event == "channel_types":
             dialog = self.add_channel_dialog
             if dialog is not None and dialog.winfo_exists():
