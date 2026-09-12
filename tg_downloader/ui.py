@@ -6,6 +6,7 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 import tkinter as tk
 from pathlib import Path
 from tkinter import font as tkfont
@@ -997,6 +998,7 @@ class ActiveDownloadIndicator(tk.Canvas):
 
 class ChannelPanel(ttk.Frame):
     PAGE_SIZES = {"queue": 200, "downloaded": 100, "failed": 100}
+    SPEED_WINDOW_SECONDS = 5.0
 
     def __init__(
         self, parent: tk.Misc, channel: Channel, db: Database,
@@ -1015,8 +1017,7 @@ class ChannelPanel(ttk.Frame):
         self.cached_counts = {"queue": 0, "downloaded": 0, "failed": 0}
         self.cached_positions: dict[int, int] = {}
         self.last_active_id: int | None = None
-        self.last_bytes = 0
-        self.last_time = time.monotonic()
+        self.speed_samples: deque[tuple[float, int]] = deque()
         self.current = tk.StringVar(value="Current file: Waiting for next file")
         self.progress_text = tk.StringVar(value="0%")
         self.speed_text = tk.StringVar(value="0 B/s")
@@ -1243,8 +1244,23 @@ class ChannelPanel(ttk.Frame):
             media_id = int(active["id"])
             size, done = int(active["size_bytes"]), int(active["bytes_downloaded"])
             now = time.monotonic()
-            speed = max(0, done - self.last_bytes) / max(0.001, now - self.last_time) if media_id == self.last_active_id else 0
-            self.last_active_id, self.last_bytes, self.last_time = media_id, done, now
+            if media_id != self.last_active_id or (
+                self.speed_samples and done < self.speed_samples[-1][1]
+            ):
+                self.speed_samples.clear()
+            self.last_active_id = media_id
+            if self.channel.paused:
+                self.speed_samples.clear()
+                self.speed_samples.append((now, done))
+                speed = 0.0
+            else:
+                self.speed_samples.append((now, done))
+                cutoff = now - self.SPEED_WINDOW_SECONDS
+                while len(self.speed_samples) > 1 and self.speed_samples[1][0] <= cutoff:
+                    self.speed_samples.popleft()
+                sample_time, sample_bytes = self.speed_samples[0]
+                elapsed = now - sample_time
+                speed = max(0, done - sample_bytes) / elapsed if elapsed > 0 else 0.0
             percent = min(100, round(done * 100 / size)) if size else 0
             prefix = "Current file (paused)" if self.channel.paused else "Current file"
             self.current.set(f"{prefix}: {active['file_name']}")
@@ -1256,6 +1272,7 @@ class ChannelPanel(ttk.Frame):
                 self.speed_text.set(f"{format_bytes(round(speed))}/s")
         else:
             self.last_active_id = None
+            self.speed_samples.clear()
             self.current.set("Current file: Channel paused" if self.channel.paused else "Current file: Waiting for next file")
             self.progress.set_value(0)
             self.progress_text.set("0%")
