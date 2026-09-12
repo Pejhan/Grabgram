@@ -38,7 +38,7 @@ except ImportError:
 
 ICON_NAMES = (
     "add", "failed", "pause", "play", "queue", "refresh", "settings", "success",
-    "previous", "next", "remove", "priority-up", "priority-down",
+    "previous", "next", "remove", "priority-up", "priority-down", "speed",
 )
 
 PRIORITY_COLORS = {"high": "#34a853", "medium": None, "low": "#d93025"}
@@ -1019,6 +1019,7 @@ class ChannelPanel(ttk.Frame):
         self.last_time = time.monotonic()
         self.current = tk.StringVar(value="Current file: Waiting for next file")
         self.progress_text = tk.StringVar(value="0%")
+        self.speed_text = tk.StringVar(value="0 B/s")
         self.stats = tk.StringVar()
         self.icons = getattr(parent.winfo_toplevel(), "icons", {})
 
@@ -1070,6 +1071,13 @@ class ChannelPanel(ttk.Frame):
         ).grid(
             row=0, column=1, sticky="e", padx=(12, 0),
         )
+        ttk.Label(
+            current_row, image=self.icons.get("speed"), style="Muted.TLabel",
+        ).grid(row=0, column=2, padx=(14, 5))
+        ttk.Label(
+            current_row, textvariable=self.speed_text, width=11,
+            anchor="w", style="Muted.TLabel",
+        ).grid(row=0, column=3, sticky="w")
         ttk.Label(
             self.details, textvariable=self.stats, style="Muted.TLabel",
         ).pack(fill="x", pady=(0, 12))
@@ -1241,15 +1249,17 @@ class ChannelPanel(ttk.Frame):
             prefix = "Current file (paused)" if self.channel.paused else "Current file"
             self.current.set(f"{prefix}: {active['file_name']}")
             self.progress.set_value(percent)
+            self.progress_text.set(f"{percent}%    {format_bytes(done)} / {format_bytes(size)}")
             if self.channel.paused:
-                self.progress_text.set(f"{percent}%    {format_bytes(done)} / {format_bytes(size)}    Paused")
+                self.speed_text.set("Paused")
             else:
-                self.progress_text.set(f"{percent}%    {format_bytes(done)} / {format_bytes(size)}    {format_bytes(round(speed))}/s")
+                self.speed_text.set(f"{format_bytes(round(speed))}/s")
         else:
             self.last_active_id = None
             self.current.set("Current file: Channel paused" if self.channel.paused else "Current file: Waiting for next file")
             self.progress.set_value(0)
             self.progress_text.set("0%")
+            self.speed_text.set("Paused" if self.channel.paused else "0 B/s")
         for kind, count in counts.items():
             self.notebook.tab(self.tab_indexes[kind], text=f"{kind.capitalize()} ({count})")
         kind = self.selected_tab()
