@@ -405,23 +405,31 @@ class AddChannelDialog(tk.Toplevel):
         self.grab_set()
         self.columnconfigure(1, weight=1)
         self.identifier = tk.StringVar()
-        self.folder = tk.StringVar()
+        self.folder_prefix = tk.StringVar()
+        self.folder_suffix = tk.StringVar()
+        self.folder_separator = tk.StringVar()
         self.duration = tk.StringVar(value="1")
         self.size = tk.StringVar(value="2")
         self.file_types_text = tk.StringVar(value="All file types")
         self.selected_file_types: tuple[str, ...] = ()
         self.available_file_types: list[tuple[str, int]] = []
         self.inspect_request_id: str | None = None
-        self.folder_prefix = ""
-        self.folder_edited = False
-        self.setting_folder = False
 
         ttk.Label(self, text="Channel username, link, or ID:").grid(row=0, column=0, sticky="w", padx=12, pady=7)
         self.identifier_entry = ttk.Entry(self, textvariable=self.identifier, width=42)
         self.identifier_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(0, 12), pady=7)
         ttk.Label(self, text="Download folder:").grid(row=1, column=0, sticky="w", padx=12, pady=7)
-        ttk.Entry(self, textvariable=self.folder, width=42).grid(
-            row=1, column=1, columnspan=2, sticky="ew", padx=(0, 12), pady=7,
+        folder_row = ttk.Frame(self)
+        folder_row.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 12), pady=7)
+        folder_row.columnconfigure(2, weight=1)
+        ttk.Entry(
+            folder_row, textvariable=self.folder_prefix, state="readonly", width=24,
+        ).grid(row=0, column=0, sticky="ew")
+        ttk.Label(folder_row, textvariable=self.folder_separator).grid(
+            row=0, column=1, padx=(3, 3),
+        )
+        ttk.Entry(folder_row, textvariable=self.folder_suffix, width=18).grid(
+            row=0, column=2, sticky="ew",
         )
         ttk.Label(self, text="File types:").grid(row=2, column=0, sticky="w", padx=12, pady=7)
         ttk.Entry(self, textvariable=self.file_types_text, state="readonly", width=36).grid(
@@ -443,7 +451,7 @@ class AddChannelDialog(tk.Toplevel):
         ).grid(row=4, column=1, sticky="w", pady=7)
 
         self.identifier.trace_add("write", self._identifier_changed)
-        self.folder.trace_add("write", self._folder_changed)
+        self.folder_suffix.trace_add("write", self._folder_suffix_changed)
         actions = ttk.Frame(self)
         actions.grid(row=5, column=0, columnspan=3, sticky="e", padx=12, pady=12)
         ttk.Button(actions, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
@@ -453,16 +461,15 @@ class AddChannelDialog(tk.Toplevel):
         self.identifier_entry.focus_set()
 
     def _identifier_changed(self, *_args: Any) -> None:
-        if self.folder_edited:
-            return
-        self.folder_prefix = suggested_channel_folder(self.identifier.get())
-        self.setting_folder = True
-        self.folder.set(self.folder_prefix)
-        self.setting_folder = False
+        self.folder_prefix.set(suggested_channel_folder(self.identifier.get()))
 
-    def _folder_changed(self, *_args: Any) -> None:
-        if not self.setting_folder:
-            self.folder_edited = True
+    def _folder_suffix_changed(self, *_args: Any) -> None:
+        suffix = self.folder_suffix.get()
+        without_separator = suffix.lstrip("_")
+        if without_separator != suffix:
+            self.folder_suffix.set(without_separator)
+            return
+        self.folder_separator.set("_" if suffix.strip() else "")
 
     def refresh_file_types(self) -> None:
         identifier = self.identifier.get().strip()
@@ -496,19 +503,7 @@ class AddChannelDialog(tk.Toplevel):
             return
         folder_prefix = str(data.get("folder_prefix") or data.get("username") or "").strip()
         if folder_prefix:
-            old_prefix = self.folder_prefix
-            self.folder_prefix = folder_prefix
-            if not self.folder_edited:
-                self.setting_folder = True
-                self.folder.set(folder_prefix)
-                self.setting_folder = False
-            elif old_prefix and self.folder.get().casefold().startswith(
-                f"{old_prefix.casefold()}_"
-            ):
-                suffix = self.folder.get()[len(old_prefix):]
-                self.setting_folder = True
-                self.folder.set(f"{folder_prefix}{suffix}")
-                self.setting_folder = False
+            self.folder_prefix.set(folder_prefix)
         self.available_file_types = [
             (str(item["extension"]), int(item["count"])) for item in data.get("file_types", [])
         ]
@@ -535,25 +530,16 @@ class AddChannelDialog(tk.Toplevel):
         except ValueError:
             messagebox.showwarning("Invalid minimum", "Minimum length and size must be numbers.", parent=self)
             return
-        folder = self.folder.get().strip()
-        if self.folder_prefix:
-            normalized_folder = folder.casefold()
-            normalized_prefix = self.folder_prefix.casefold()
-            if normalized_folder != normalized_prefix and not normalized_folder.startswith(
-                f"{normalized_prefix}_"
-            ):
-                messagebox.showwarning(
-                    "Invalid download folder",
-                    f'The folder must be "{self.folder_prefix}" or start with '
-                    f'"{self.folder_prefix}_".',
-                    parent=self,
-                )
-                return
-        # Let the engine use Telegram's resolved username unless the user chose
-        # a custom folder (for example, by appending "_audio" or "_video").
-        folder = folder if self.folder_edited else ""
+        folder_suffix = self.folder_suffix.get().strip()
+        if re.search(r'[<>:"/\\|?*\x00-\x1f]', folder_suffix):
+            messagebox.showwarning(
+                "Invalid download folder",
+                "The folder suffix cannot contain path separators or Windows-invalid characters.",
+                parent=self,
+            )
+            return
         self.engine.command(
-            "add_channel", identifier=identifier, folder=folder,
+            "add_channel", identifier=identifier, folder="", folder_suffix=folder_suffix,
             min_duration_seconds=duration, min_size_bytes=size,
             media_types=self.selected_file_types,
         )

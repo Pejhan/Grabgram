@@ -445,7 +445,8 @@ class DownloaderEngine:
             await asyncio.sleep(0.1)
 
     async def _add_channel(self, identifier: str, folder: str, min_duration_seconds: int,
-                           min_size_bytes: int, media_types: tuple[str, ...] = ()) -> None:
+                           min_size_bytes: int, media_types: tuple[str, ...] = (),
+                           folder_suffix: str | None = None) -> None:
         try:
             entity = await self._client.get_entity(identifier)
             title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
@@ -453,16 +454,25 @@ class DownloaderEngine:
             folder_prefix = re.sub(
                 r"[^A-Za-z0-9_.-]+", "_", str(folder_source).strip().lstrip("@"),
             ).strip("._") or str(entity.id)
-            folder = folder.strip() or folder_prefix
-            normalized_folder = folder.casefold()
-            normalized_prefix = folder_prefix.casefold()
-            if normalized_folder != normalized_prefix and not normalized_folder.startswith(
-                f"{normalized_prefix}_"
-            ):
-                raise ValueError(
-                    f'Download folder must be "{folder_prefix}" or start with '
-                    f'"{folder_prefix}_"'
-                )
+            if folder_suffix is not None:
+                folder_suffix = folder_suffix.strip().lstrip("_")
+                if re.search(r'[<>:"/\\|?*\x00-\x1f]', folder_suffix):
+                    raise ValueError(
+                        "Download folder suffix cannot contain path separators or "
+                        "Windows-invalid characters"
+                    )
+                folder = f"{folder_prefix}_{folder_suffix}" if folder_suffix else folder_prefix
+            else:
+                folder = folder.strip() or folder_prefix
+                normalized_folder = folder.casefold()
+                normalized_prefix = folder_prefix.casefold()
+                if normalized_folder != normalized_prefix and not normalized_folder.startswith(
+                    f"{normalized_prefix}_"
+                ):
+                    raise ValueError(
+                        f'Download folder must be "{folder_prefix}" or start with '
+                        f'"{folder_prefix}_"'
+                    )
             if Path(folder).name != folder or "/" in folder or "\\" in folder:
                 raise ValueError("Download folder must be a single folder name")
             self._folder_path(folder)

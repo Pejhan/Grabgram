@@ -118,6 +118,15 @@ class MediaDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 await engine._add_channel("sample", "sample_channel_audio", 0, 0)
             self.assertEqual("sample_channel_audio", db.channels()[0].folder)
 
+            with patch.object(
+                engine, "_track_authenticated_task",
+                side_effect=lambda coroutine: coroutine.close(),
+            ):
+                await engine._add_channel(
+                    "sample", "", 0, 0, folder_suffix="_video",
+                )
+            self.assertEqual("sample_channel_video", db.channels()[0].folder)
+
 
 class BandwidthLimiterTests(unittest.IsolatedAsyncioTestCase):
     async def test_unlimited_rate_does_not_sleep(self) -> None:
