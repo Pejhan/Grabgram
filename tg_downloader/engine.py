@@ -12,12 +12,12 @@ from typing import Any, Callable
 
 try:
     from .config import Config
-    from .database import Channel, Database, MediaRecord
+    from .database import Channel, Database
     from .media import safe_filename, unique_output_path
     from .proxy import load_mtproto_proxy, telethon_client_options
 except ImportError:  # Supports running the module files directly as well.
     from config import Config
-    from database import Channel, Database, MediaRecord
+    from database import Channel, Database
     from media import safe_filename, unique_output_path
     from proxy import load_mtproto_proxy, telethon_client_options
 
@@ -423,22 +423,6 @@ class DownloaderEngine:
                 else:
                     self._paused_channel_ids.discard(channel_id)
                 self._emit("channel_pause_changed", channel_id=channel_id, paused=paused)
-            elif name == "shift_channel_priority":
-                self.db.shift_channel_priority(int(data["channel_id"]), int(data["amount"]))
-                self._emit("database_changed")
-            elif name == "shift_media_priority":
-                self.db.shift_media_priority(
-                    [int(media_id) for media_id in data["media_ids"]], int(data["amount"]),
-                )
-                self._emit("database_changed")
-            elif name == "retry_media":
-                media_ids = [int(media_id) for media_id in data.get("media_ids", [])]
-                if not media_ids and data.get("status"):
-                    media_ids = self.db.media_ids_by_status(
-                        int(data["channel_id"]), str(data["status"]),
-                    )
-                self.db.retry(media_ids, include_downloaded=bool(data.get("include_downloaded")))
-                self._emit("database_changed")
             elif name == "remove_channel":
                 channel_id = int(data["channel_id"])
                 self.db.set_channel_enabled(channel_id, False)
@@ -583,47 +567,32 @@ class DownloaderEngine:
         )
 
     async def _record_message(self, channel: Channel, message: Any, priority: int) -> bool:
-        record = self._media_record(message)
-        added = self.db.add_media_batch(channel, [record], priority) > 0
-        if added:
-            self._emit("queue_changed", channel_id=channel.id)
-        return added
-
-    def _media_record(self, message: Any) -> MediaRecord:
+        self.db.note_seen(channel.id, int(message.id))
         info = self._media_info(message)
+        if not info:
+            return False
         date = message.date
         if date and date.tzinfo is None:
             date = date.replace(tzinfo=timezone.utc)
-        return MediaRecord(
-            message_id=int(message.id),
-            document_id=info.media_id if info else None,
-            file_name=info.filename if info else None,
-            size_bytes=info.size if info else 0,
-            duration_seconds=info.duration if info else 0,
-            message_date=date.isoformat() if date else "",
+        added = self.db.add_media(
+            channel=channel, message_id=int(message.id), document_id=info.media_id,
+            file_name=info.filename, size_bytes=info.size, duration_seconds=info.duration,
+            message_date=date.isoformat() if date else "", priority=priority,
         )
+        if added:
+            self._emit("queue_changed", channel_id=channel.id)
+        return added
 
     async def _scan_channel(self, channel: Channel, full: bool) -> None:
         try:
             self._emit("scan", channel_id=channel.id, active=True)
             latest = next((c for c in self.db.channels() if c.id == channel.id), channel)
             kwargs = {} if full else {"min_id": latest.last_seen_message_id}
-            records: list[MediaRecord] = []
             async for message in self._client.iter_messages(channel.identifier, **kwargs):
                 if channel.id in self._removed_channel_ids:
-                    records.clear()
                     break
-                records.append(self._media_record(message))
-                if len(records) >= 50:
-                    added = self.db.add_media_batch(channel, records, priority=10 if full else 0)
-                    records.clear()
-                    if added:
-                        self._emit("queue_changed", channel_id=channel.id)
+                await self._record_message(channel, message, priority=10 if full else 0)
                 await asyncio.sleep(0)
-            if records:
-                added = self.db.add_media_batch(channel, records, priority=10 if full else 0)
-                if added:
-                    self._emit("queue_changed", channel_id=channel.id)
             if full:
                 self.db.set_scan_complete(channel.id)
         except asyncio.CancelledError:

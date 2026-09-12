@@ -5,7 +5,7 @@ import unittest
 import sqlite3
 from pathlib import Path
 
-from tg_downloader.database import Database, MediaRecord
+from tg_downloader.database import Database
 
 
 class DatabaseTests(unittest.TestCase):
@@ -30,37 +30,6 @@ class DatabaseTests(unittest.TestCase):
         self.assertFalse(self.add(1, duration=59))
         self.assertFalse(self.add(2, size=999))
         self.assertTrue(self.add(3, duration=60, size=1_000))
-
-    def test_media_batch_uses_one_revision_and_records_latest_seen_message(self) -> None:
-        before = self.db.revision
-        inserted = self.db.add_media_batch(
-            self.channel,
-            [
-                MediaRecord(10, 10, "first.mp3", 5_000, 120, ""),
-                MediaRecord(11, None, None, 0, 0, ""),
-                MediaRecord(12, 12, "too-small.mp3", 999, 120, ""),
-                MediaRecord(13, 13, "second.mp3", 5_000, 120, ""),
-            ],
-            priority=10,
-        )
-        self.assertEqual(2, inserted)
-        self.assertEqual(before + 1, self.db.revision)
-        channel = next(item for item in self.db.channels() if item.id == self.channel.id)
-        self.assertEqual(13, channel.last_seen_message_id)
-
-    def test_channel_overview_and_tab_counts_share_runtime_totals(self) -> None:
-        self.add(1)
-        self.add(2)
-        active = self.db.claim_next_queued()
-        channel, queued, downloading = self.db.channel_overviews(True)[0]
-        self.assertEqual(self.channel.id, channel.id)
-        self.assertEqual(2, queued)
-        self.assertTrue(downloading)
-        self.assertEqual(
-            {"queue": 2, "downloaded": 0, "failed": 0},
-            self.db.tab_counts(self.channel.id),
-        )
-        self.assertIsNotNone(active)
 
     def test_undated_media_ignores_length_but_still_obeys_size(self) -> None:
         self.assertTrue(self.add(1, duration=0, size=1_000))

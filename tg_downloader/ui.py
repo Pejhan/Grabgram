@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import math
 import queue
 import re
 import threading
 import time
 from collections import deque
-from dataclasses import replace
 import tkinter as tk
 from pathlib import Path
 from tkinter import font as tkfont
@@ -54,8 +52,6 @@ MUTED_TEXT = "#66717d"
 ACCENT = "#1677ff"
 BORDER_COLOR = "#dfe4e8"
 
-LOGGER = logging.getLogger(__name__)
-
 
 def configure_application_theme(window: tk.Tk) -> None:
     """Apply the restrained desktop palette used by the main workspace."""
@@ -66,6 +62,31 @@ def configure_application_theme(window: tk.Tk) -> None:
     except tk.TclError:
         pass
     style.configure(".", font=("Segoe UI", 9), foreground=TEXT_COLOR)
+    # ttk widgets are not transparent. Give every generic surface widget the
+    # content fill so the Clam theme does not show gray rectangles behind it.
+    style.configure("TFrame", background=CONTENT_BACKGROUND)
+    style.configure("TLabel", background=CONTENT_BACKGROUND, foreground=TEXT_COLOR)
+    style.configure("TCheckbutton", background=CONTENT_BACKGROUND, foreground=TEXT_COLOR)
+    style.map(
+        "TCheckbutton",
+        background=[("disabled", CONTENT_BACKGROUND), ("active", CONTENT_BACKGROUND)],
+        foreground=[("disabled", MUTED_TEXT)],
+    )
+    style.configure(
+        "TButton", background=CONTENT_BACKGROUND, foreground=TEXT_COLOR,
+        bordercolor=BORDER_COLOR, lightcolor=CONTENT_BACKGROUND,
+        darkcolor=CONTENT_BACKGROUND, padding=(8, 5), relief="flat",
+    )
+    style.map(
+        "TButton",
+        background=[
+            ("disabled", CONTENT_BACKGROUND),
+            ("pressed", "#e5edf5"),
+            ("active", "#f0f5fa"),
+        ],
+        foreground=[("disabled", MUTED_TEXT)],
+        bordercolor=[("focus", ACCENT), ("active", "#cbd5df")],
+    )
     style.configure("App.TFrame", background=APP_BACKGROUND)
     style.configure("Topbar.TFrame", background=CONTENT_BACKGROUND)
     style.configure("Sidebar.TFrame", background=SIDEBAR_BACKGROUND)
@@ -96,7 +117,11 @@ def configure_application_theme(window: tk.Tk) -> None:
     )
     style.map(
         "Icon.TButton",
-        background=[("active", "#f0f5fa"), ("pressed", "#e5edf5")],
+        background=[
+            ("disabled", CONTENT_BACKGROUND),
+            ("pressed", "#e5edf5"),
+            ("active", "#f0f5fa"),
+        ],
         bordercolor=[("focus", ACCENT), ("active", "#cbd5df")],
     )
     style.configure(
@@ -105,7 +130,9 @@ def configure_application_theme(window: tk.Tk) -> None:
     )
     style.map(
         "Primary.TButton",
-        background=[("active", "#0b68df"), ("pressed", "#0759c5")],
+        background=[
+            ("disabled", ACCENT), ("pressed", "#0759c5"), ("active", "#0b68df"),
+        ],
         foreground=[("disabled", "#d7e6fb")],
     )
     style.configure(
@@ -322,6 +349,7 @@ class FileTypeDialog(tk.Toplevel):
         selected: tuple[str, ...], on_apply: Any,
     ):
         super().__init__(parent)
+        self.configure(background=CONTENT_BACKGROUND)
         self.parent_dialog = parent
         self.file_types = file_types
         self.on_apply = on_apply
@@ -369,6 +397,7 @@ class FileTypeDialog(tk.Toplevel):
 class AddChannelDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, engine: DownloaderEngine):
         super().__init__(parent)
+        self.configure(background=CONTENT_BACKGROUND)
         self.engine = engine
         self.title("Add channel")
         self.resizable(False, False)
@@ -501,6 +530,7 @@ class AddChannelDialog(tk.Toplevel):
 class SettingsDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, db: Database, config: Config):
         super().__init__(parent)
+        self.configure(background=CONTENT_BACKGROUND)
         self.db = db
         self.config = config
         self.original = load_mtproto_proxy(db)
@@ -660,7 +690,6 @@ class RoundedNotebook(ttk.Frame):
         self.selected_index = -1
         self.tab_bounds: list[tuple[int, int]] = []
         self.rendered_tabs: list[Any] = []
-        self.tab_backgrounds: dict[tuple[int, bool], tk.PhotoImage] = {}
         self.tab_font = tkfont.Font(parent, family="Segoe UI", size=9, weight="bold")
         self.tab_bar = tk.Canvas(
             self, height=self.TAB_HEIGHT + 8, background=CONTENT_BACKGROUND,
@@ -701,35 +730,17 @@ class RoundedNotebook(ttk.Frame):
         tab = self.tabs[self.index(tab_id)]
         if not options:
             return dict(tab)
-        changed = False
         if "text" in options:
-            text = str(options["text"])
-            changed = changed or text != tab["text"]
-            tab["text"] = text
+            tab["text"] = str(options["text"])
         if "image" in options:
-            image = options["image"]
-            changed = changed or image is not tab["image"]
-            tab["image"] = image
-        if changed:
-            self._redraw()
+            tab["image"] = options["image"]
+        self._redraw()
         return None
-
-    def set_texts(self, texts: dict[int, str]) -> None:
-        changed = False
-        for index, text in texts.items():
-            normalized = str(text)
-            if self.tabs[index]["text"] != normalized:
-                self.tabs[index]["text"] = normalized
-                changed = True
-        if changed:
-            self._redraw()
 
     def _show(self, index: int, notify: bool = True) -> None:
         if not 0 <= index < len(self.tabs):
             return
         changed = index != self.selected_index
-        if not changed:
-            return
         if self.selected_index >= 0:
             self.tabs[self.selected_index]["page"].pack_forget()
         self.selected_index = index
@@ -760,22 +771,18 @@ class RoundedNotebook(ttk.Frame):
             selected = index == self.selected_index
             fill = CONTENT_BACKGROUND if selected else "#e3e7eb"
             outline = "#c5ced7" if selected else "#d2d8de"
-            cache_key = (width, selected)
-            tab_image = self.tab_backgrounds.get(cache_key)
-            if tab_image is None:
-                scale = 4
-                rendered = Image.new(
-                    "RGBA", (width * scale, self.TAB_HEIGHT * scale), (0, 0, 0, 0),
-                )
-                ImageDraw.Draw(rendered).rounded_rectangle(
-                    (scale, scale, width * scale - scale - 1, self.TAB_HEIGHT * scale - scale - 1),
-                    radius=self.TAB_RADIUS * scale, fill=fill, outline=outline, width=scale,
-                )
-                rendered = rendered.resize(
-                    (width, self.TAB_HEIGHT), Image.Resampling.LANCZOS,
-                )
-                tab_image = ImageTk.PhotoImage(rendered, master=self.tab_bar)
-                self.tab_backgrounds[cache_key] = tab_image
+            scale = 4
+            rendered = Image.new(
+                "RGBA", (width * scale, self.TAB_HEIGHT * scale), (0, 0, 0, 0),
+            )
+            ImageDraw.Draw(rendered).rounded_rectangle(
+                (scale, scale, width * scale - scale - 1, self.TAB_HEIGHT * scale - scale - 1),
+                radius=self.TAB_RADIUS * scale, fill=fill, outline=outline, width=scale,
+            )
+            rendered = rendered.resize(
+                (width, self.TAB_HEIGHT), Image.Resampling.LANCZOS,
+            )
+            tab_image = ImageTk.PhotoImage(rendered, master=self.tab_bar)
             self.rendered_tabs.append(tab_image)
             self.tab_bar.create_image(left, top, image=tab_image, anchor="nw")
             content_left = left + 14
@@ -827,22 +834,28 @@ class MediaTable(ttk.Frame):
         xscroll.grid(row=1, column=0, sticky="ew")
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
-        self.row_signatures: dict[str, tuple[Any, ...]] = {}
+        self.signature: tuple[Any, ...] | None = None
 
     def selected_ids(self) -> list[int]:
         return [int(item) for item in self.tree.selection()]
 
     def populate(self, rows: list[Any], positions: dict[int, int], channel_paused: bool = False) -> None:
-        desired_ids = [str(int(row["id"])) for row in rows]
-        desired_set = set(desired_ids)
-        obsolete = [item_id for item_id in self.tree.get_children() if item_id not in desired_set]
-        if obsolete:
-            self.tree.delete(*obsolete)
-            for item_id in obsolete:
-                self.row_signatures.pop(item_id, None)
+        signature = tuple(
+            (
+                int(row["id"]), row["status"], row["error"],
+                int(row["priority_level"]), int(row["priority_rank"]),
+                row["message_date"], row["downloaded_at"],
+                positions.get(int(row["id"])) if row["status"] == "queued" and not channel_paused else None,
+                channel_paused,
+            )
+            for row in rows
+        )
+        if signature == self.signature:
+            return
+        self.signature = signature
+        self.tree.delete(*self.tree.get_children())
         for row_index, row in enumerate(rows):
             media_id = int(row["id"])
-            item_id = str(media_id)
             status = row["status"]
             size = int(row["size_bytes"])
             duration = int(row["duration_seconds"])
@@ -869,19 +882,10 @@ class MediaTable(ttk.Frame):
                 "text": "",
                 "values": tuple(values[column] for column in self.columns),
                 "tags": ("even" if row_index % 2 == 0 else "odd",),
-                "image": image or "",
             }
-            signature = (
-                options["values"], options["tags"], item_priority,
-            )
-            if item_id not in self.row_signatures:
-                self.tree.insert("", row_index, iid=item_id, **options)
-            else:
-                if self.row_signatures[item_id] != signature:
-                    self.tree.item(item_id, **options)
-                if self.tree.index(item_id) != row_index:
-                    self.tree.move(item_id, "", row_index)
-            self.row_signatures[item_id] = signature
+            if image is not None:
+                options["image"] = image
+            self.tree.insert("", "end", iid=str(media_id), **options)
 
 
 class BlueProgressBar(tk.Canvas):
@@ -900,10 +904,7 @@ class BlueProgressBar(tk.Canvas):
         self.bind("<Configure>", self._redraw)
 
     def set_value(self, value: float) -> None:
-        value = min(100.0, max(0.0, float(value)))
-        if value == self.value:
-            return
-        self.value = value
+        self.value = min(100.0, max(0.0, float(value)))
         self._redraw()
 
     def _redraw(self, _event: Any = None) -> None:
@@ -927,6 +928,8 @@ class ActiveDownloadIndicator(tk.Canvas):
     COLOR = "#16a34a"
     FRAME_MS = 33
     CYCLE_SECONDS = 1.6
+    FRAME_COUNT = round(CYCLE_SECONDS * 1000 / FRAME_MS)
+    RENDER_SCALE = 4
 
     def __init__(self, parent: tk.Misc):
         super().__init__(
@@ -936,6 +939,8 @@ class ActiveDownloadIndicator(tk.Canvas):
         self.active = False
         self.started_at = 0.0
         self.animation_job: str | None = None
+        self.frame_cache: dict[str, list[tk.PhotoImage]] = {}
+        self.rendered_frame: tk.PhotoImage | None = None
 
     @staticmethod
     def _blend(foreground: str, background: str, opacity: float) -> str:
@@ -949,6 +954,46 @@ class ActiveDownloadIndicator(tk.Canvas):
 
     def set_background(self, color: str) -> None:
         self.configure(background=color)
+
+    def _frames_for_background(self, background: str) -> list[tk.PhotoImage]:
+        cached = self.frame_cache.get(background)
+        if cached is not None:
+            return cached
+        scale = self.RENDER_SCALE
+        frames: list[tk.PhotoImage] = []
+        for frame_index in range(self.FRAME_COUNT):
+            elapsed = frame_index * self.CYCLE_SECONDS / self.FRAME_COUNT
+            rendered = Image.new(
+                "RGB", (self.WIDTH * scale, self.HEIGHT * scale), background,
+            )
+            draw = ImageDraw.Draw(rendered)
+            center_x = self.WIDTH * scale / 2
+            center_y = self.HEIGHT * scale / 2
+            for delay in (0.0, self.CYCLE_SECONDS / 2):
+                phase = ((elapsed - delay) % self.CYCLE_SECONDS) / self.CYCLE_SECONDS
+                radius = (1.5 + (8.4 - 1.5) * phase) * scale
+                color = self._blend(self.COLOR, background, 0.9 * (1.0 - phase))
+                draw.ellipse(
+                    (
+                        center_x - radius, center_y - radius,
+                        center_x + radius, center_y + radius,
+                    ),
+                    fill=color,
+                )
+            dot_radius = 2.6 * scale
+            draw.ellipse(
+                (
+                    center_x - dot_radius, center_y - dot_radius,
+                    center_x + dot_radius, center_y + dot_radius,
+                ),
+                fill=self.COLOR,
+            )
+            rendered = rendered.resize(
+                (self.WIDTH, self.HEIGHT), Image.Resampling.LANCZOS,
+            )
+            frames.append(ImageTk.PhotoImage(rendered, master=self))
+        self.frame_cache[background] = frames
+        return frames
 
     def set_active(self, active: bool) -> None:
         active = bool(active)
@@ -971,23 +1016,11 @@ class ActiveDownloadIndicator(tk.Canvas):
             return
         elapsed = time.monotonic() - self.started_at
         background = str(self.cget("background"))
+        frames = self._frames_for_background(background)
+        frame_index = int(elapsed / self.CYCLE_SECONDS * self.FRAME_COUNT) % self.FRAME_COUNT
+        self.rendered_frame = frames[frame_index]
         self.delete("all")
-        center_x, center_y = self.WIDTH / 2, self.HEIGHT / 2
-        for delay in (0.0, self.CYCLE_SECONDS / 2):
-            phase = ((elapsed - delay) % self.CYCLE_SECONDS) / self.CYCLE_SECONDS
-            radius = 1.5 + (8.4 - 1.5) * phase
-            color = self._blend(self.COLOR, background, 0.9 * (1.0 - phase))
-            self.create_oval(
-                center_x - radius, center_y - radius,
-                center_x + radius, center_y + radius,
-                fill=color, outline="",
-            )
-        dot_radius = 2.6
-        self.create_oval(
-            center_x - dot_radius, center_y - dot_radius,
-            center_x + dot_radius, center_y + dot_radius,
-            fill=self.COLOR, outline="",
-        )
+        self.create_image(0, 0, image=self.rendered_frame, anchor="nw")
         self.animation_job = self.after(self.FRAME_MS, self._draw_frame)
 
     def destroy(self) -> None:
@@ -1147,9 +1180,9 @@ class ChannelPanel(ttk.Frame):
         self.engine.command("rescan", channel_id=self.channel.id)
 
     def shift_channel_priority(self, amount: int) -> None:
-        self.engine.command(
-            "shift_channel_priority", channel_id=self.channel.id, amount=amount,
-        )
+        self.db.shift_channel_priority(self.channel.id, amount)
+        self.channel = next(channel for channel in self.db.channels() if channel.id == self.channel.id)
+        self.refresh(self.db.queue_positions())
 
     def shift_selected_file_priority(self, kind: str, amount: int) -> None:
         ids = self.tables[kind].selected_ids()
@@ -1158,17 +1191,20 @@ class ChannelPanel(ttk.Frame):
                 "Set priority", "Select one or more files first.", parent=self,
             )
             return
-        self.engine.command("shift_media_priority", media_ids=ids, amount=amount)
+        self.db.shift_media_priority(ids, amount)
+        self.table_revisions[kind] = -1
+        self.refresh(self.db.queue_positions())
 
     def toggle_channel_pause(self) -> None:
         paused = not self.channel.paused
-        if not self.engine.command("set_channel_paused", channel_id=self.channel.id, paused=paused):
-            return
-        self.channel = replace(self.channel, paused=paused)
+        self.db.set_channel_paused(self.channel.id, paused)
+        self.channel = next(channel for channel in self.db.channels() if channel.id == self.channel.id)
+        self.engine.command("set_channel_paused", channel_id=self.channel.id, paused=paused)
         self.channel_pause_button.set_icon(
             "play" if paused else "pause",
             "Resume channel" if paused else "Pause channel",
         )
+        self.refresh(self.cached_positions)
 
     def remove_channel(self) -> None:
         if messagebox.askyesno(
@@ -1179,13 +1215,16 @@ class ChannelPanel(ttk.Frame):
             "Adding the channel again will restore it.",
             parent=self,
         ):
+            self.db.set_channel_enabled(self.channel.id, False)
             self.engine.command("remove_channel", channel_id=self.channel.id)
+            app = self.winfo_toplevel()
+            if hasattr(app, "sync_cards"):
+                app.sync_cards()
 
     def retry_failed(self) -> None:
-        self.engine.command(
-            "retry_media", media_ids=self.tables["failed"].selected_ids(),
-            channel_id=self.channel.id, status="failed",
-        )
+        ids = self.tables["failed"].selected_ids() or self.db.media_ids_by_status(self.channel.id, "failed")
+        self.db.retry(ids)
+        self.refresh(self.cached_positions)
 
     def redownload(self) -> None:
         ids = self.tables["downloaded"].selected_ids()
@@ -1193,15 +1232,14 @@ class ChannelPanel(ttk.Frame):
             messagebox.showinfo("Redownload", "Select one or more downloaded files first.", parent=self)
             return
         if messagebox.askyesno("Redownload", "Queue the selected files again?", parent=self):
-            self.engine.command(
-                "retry_media", media_ids=ids, include_downloaded=True,
-            )
+            self.db.retry(ids, include_downloaded=True)
+            self.refresh(self.cached_positions)
 
     def record_count(self, kind: str) -> int:
         return self.db.queue_count(self.channel.id) if kind == "queue" else self.db.status_count(self.channel.id, kind)
 
     def change_page(self, kind: str, amount: int) -> None:
-        last_page = self.pages(self.cached_counts[kind], self.PAGE_SIZES[kind]) - 1
+        last_page = self.pages(self.record_count(kind), self.PAGE_SIZES[kind]) - 1
         self.page_numbers[kind] = min(last_page, max(0, self.page_numbers[kind] + amount))
         self.table_revisions[kind] = -1
         self.refresh(self.cached_positions)
@@ -1221,7 +1259,9 @@ class ChannelPanel(ttk.Frame):
         )
         revision = self.db.revision
         if revision != self.count_revision:
-            self.cached_counts = self.db.tab_counts(self.channel.id)
+            self.cached_counts = {
+                kind: self.record_count(kind) for kind in ("queue", "downloaded", "failed")
+            }
             self.count_revision = revision
         counts = self.cached_counts
         title = f"{self.channel.title} (Paused)" if self.channel.paused else self.channel.title
@@ -1271,10 +1311,8 @@ class ChannelPanel(ttk.Frame):
             self.progress.set_value(0)
             self.progress_text.set("0%")
             self.speed_text.set("Paused" if self.channel.paused else "0 B/s")
-        self.notebook.set_texts({
-            self.tab_indexes[kind]: f"{kind.capitalize()} ({count})"
-            for kind, count in counts.items()
-        })
+        for kind, count in counts.items():
+            self.notebook.tab(self.tab_indexes[kind], text=f"{kind.capitalize()} ({count})")
         kind = self.selected_tab()
         if self.table_revisions[kind] == revision:
             return
@@ -1360,8 +1398,6 @@ class SidebarChannelItem(tk.Frame):
         self.avatar_store = avatar_store
         self.priority = "medium"
         self.selected = False
-        self.summary_signature: tuple[Any, ...] | None = None
-        self.paint_signature: tuple[str, str, str, str] | None = None
         self.marker = tk.Frame(self, width=7, background=SIDEBAR_BACKGROUND)
         self.marker.pack(side="left", fill="y")
         self.avatar_label = tk.Label(
@@ -1402,10 +1438,6 @@ class SidebarChannelItem(tk.Frame):
         self.set_selected(self.selected)
 
     def _paint(self, background: str, title_color: str, detail_color: str) -> None:
-        signature = (background, title_color, detail_color, self.priority)
-        if signature == self.paint_signature:
-            return
-        self.paint_signature = signature
         self.configure(background=background)
         self.avatar_label.configure(background=background)
         self.text_area.configure(background=background)
@@ -1415,13 +1447,7 @@ class SidebarChannelItem(tk.Frame):
         self.detail_label.configure(background=background, foreground=detail_color)
         self.marker.configure(background=PRIORITY_COLORS[self.priority] or background)
 
-    def update_channel(
-        self, channel: Channel, queued: int, downloading: bool, force: bool = False,
-    ) -> None:
-        signature = (channel, int(queued), bool(downloading))
-        if not force and signature == self.summary_signature:
-            return
-        self.summary_signature = signature
+    def update_channel(self, channel: Channel, queued: int, downloading: bool) -> None:
         self.priority = priority_name(channel.priority_level)
         self.channel = channel
         self.avatar_image = self.avatar_store.get(channel, 34)
@@ -1442,10 +1468,6 @@ class SidebarChannelItem(tk.Frame):
 
 
 class DownloaderApp(tk.Tk):
-    EVENT_BUDGET_SECONDS = 0.008
-    MAX_EVENTS_PER_POLL = 100
-    SLOW_UI_SECONDS = 0.050
-
     def __init__(self, config: Config, db: Database):
         super().__init__()
         configure_application_theme(self)
@@ -1464,11 +1486,9 @@ class DownloaderApp(tk.Tk):
         self.authentication_busy = True
         self.closing = False
         self.poll_job: str | None = None
-        self.cards_revision = -1
         self.position_revision = -1
         self.cached_positions: dict[int, int] = {}
-        self.next_poll_due = time.monotonic() + 0.1
-        self.engine = DownloaderEngine(config, db, self._enqueue_event)
+        self.engine = DownloaderEngine(config, db, lambda name, payload: self.events.put((name, payload)))
         self.title("Channel Media Downloader")
         self.geometry("1280x820")
         self.minsize(900, 600)
@@ -1584,24 +1604,16 @@ class DownloaderApp(tk.Tk):
             style="Primary.TButton",
         ).pack()
 
-    def _enqueue_event(self, name: str, payload: dict[str, Any]) -> None:
-        if name in {"progress", "queue_changed"}:
-            return
-        self.events.put((name, payload))
-
-    def sync_cards(self, force: bool = False) -> None:
-        revision = self.db.revision
-        if not force and revision == self.cards_revision:
-            return
-        overviews = self.db.channel_overviews(True)
-        enabled_channels = {channel.id: channel for channel, _, _ in overviews}
+    def sync_cards(self) -> None:
+        channels = self.db.channels(True)
+        enabled_channels = {channel.id: channel for channel in channels}
         for channel_id in list(self.cards):
             if channel_id not in enabled_channels:
                 self.cards.pop(channel_id).destroy()
                 item = self.sidebar_items.pop(channel_id, None)
                 if item is not None:
                     item.destroy()
-        for channel, queued, downloading in overviews:
+        for channel in enabled_channels.values():
             if channel.id not in self.cards:
                 card = ChannelPanel(
                     self.body, channel, self.db, self.engine, self.avatar_store,
@@ -1613,18 +1625,16 @@ class DownloaderApp(tk.Tk):
                 item.pack(fill="x", padx=8, pady=2)
                 self.sidebar_items[channel.id] = item
             else:
-                card = self.cards[channel.id]
-                if card.channel != channel:
-                    card.channel = channel
-                    card.set_avatar()
+                self.cards[channel.id].channel = channel
+                self.cards[channel.id].set_avatar()
             self.sidebar_items[channel.id].update_channel(
-                channel, queued, downloading,
+                channel, self.db.queue_count(channel.id),
+                self.db.active_download(channel.id) is not None,
             )
-        self.channel_count.configure(text=str(len(overviews)))
+        self.channel_count.configure(text=str(len(channels)))
         if self.selected_channel_id not in enabled_channels:
-            self.selected_channel_id = overviews[0][0].id if overviews else None
+            self.selected_channel_id = channels[0].id if channels else None
         self._show_selected_channel()
-        self.cards_revision = revision
 
     def select_channel(self, channel_id: int) -> None:
         if channel_id not in self.cards:
@@ -1808,7 +1818,7 @@ class DownloaderApp(tk.Tk):
             if item is not None and hasattr(item, "channel"):
                 item.update_channel(
                     item.channel, self.db.queue_count(channel_id),
-                    self.db.active_download(channel_id) is not None, force=True,
+                    self.db.active_download(channel_id) is not None,
                 )
         elif event == "channel_types":
             dialog = self.add_channel_dialog
@@ -1818,43 +1828,20 @@ class DownloaderApp(tk.Tk):
     def poll(self) -> None:
         if self.closing:
             return
-        started = time.monotonic()
-        scheduled_delay = max(0.0, started - self.next_poll_due)
-        event_started = started
-        handled = 0
-        while handled < self.MAX_EVENTS_PER_POLL:
-            if time.monotonic() - event_started >= self.EVENT_BUDGET_SECONDS:
-                break
-            try:
+        try:
+            while True:
                 event, data = self.events.get_nowait()
-            except queue.Empty:
-                break
-            self.handle_event(event, data)
-            handled += 1
-        event_finished = time.monotonic()
+                self.handle_event(event, data)
+        except queue.Empty:
+            pass
         self.sync_cards()
-        cards_finished = time.monotonic()
         revision = self.db.revision
         if revision != self.position_revision:
             self.cached_positions = self.db.queue_positions()
             self.position_revision = revision
-        positions_finished = time.monotonic()
         if self.selected_channel_id in self.cards:
             self.cards[self.selected_channel_id].refresh(self.cached_positions)
-        finished = time.monotonic()
-        elapsed = finished - started
-        if elapsed >= self.SLOW_UI_SECONDS or scheduled_delay >= self.SLOW_UI_SECONDS:
-            LOGGER.warning(
-                "Slow UI cycle: total=%.1fms late=%.1fms events=%.1fms cards=%.1fms positions=%.1fms panel=%.1fms handled=%d",
-                elapsed * 1000, scheduled_delay * 1000,
-                (event_finished - event_started) * 1000,
-                (cards_finished - event_finished) * 1000,
-                (positions_finished - cards_finished) * 1000,
-                (finished - positions_finished) * 1000, handled,
-            )
-        delay_ms = 1 if not self.events.empty() else 1000
-        self.next_poll_due = finished + delay_ms / 1000
-        self.poll_job = self.after(delay_ms, self.poll)
+        self.poll_job = self.after(1000, self.poll)
 
     def close(self) -> None:
         if self.closing:
