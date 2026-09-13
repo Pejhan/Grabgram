@@ -77,6 +77,9 @@ CREATE TABLE IF NOT EXISTS media (
 CREATE INDEX IF NOT EXISTS media_queue_idx
 ON media(status, priority, message_date DESC, id DESC);
 
+CREATE INDEX IF NOT EXISTS media_channel_status_idx
+ON media(channel_id, status);
+
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -100,6 +103,16 @@ class Channel:
     priority_rank: int
     scan_complete: bool
     last_seen_message_id: int
+
+
+@dataclass(frozen=True)
+class MediaRecord:
+    message_id: int
+    document_id: int | None
+    file_name: str | None
+    size_bytes: int
+    duration_seconds: int
+    message_date: str
 
 
 class Database:
@@ -182,6 +195,23 @@ class Database:
         )
         with self.connect() as conn:
             return [self._channel(row) for row in conn.execute(sql)]
+
+    def channel_overviews(self, enabled_only: bool = False) -> list[tuple[Channel, int, bool]]:
+        where = "WHERE c.enabled=1" if enabled_only else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""SELECT c.*,
+                       COALESCE(SUM(CASE WHEN m.status IN ('queued','downloading') THEN 1 ELSE 0 END), 0) queued,
+                       COALESCE(MAX(CASE WHEN m.status='downloading' THEN 1 ELSE 0 END), 0) downloading
+                    FROM channels c LEFT JOIN media m ON m.channel_id=c.id
+                    {where}
+                    GROUP BY c.id
+                    ORDER BY c.priority_level, c.priority_rank, c.id"""
+            ).fetchall()
+        return [
+            (self._channel(row), int(row["queued"]), bool(row["downloading"]))
+            for row in rows
+        ]
 
     def channel_by_telegram_id(self, telegram_id: int) -> Channel | None:
         with self.connect() as conn:
@@ -340,33 +370,61 @@ class Database:
                    WHERE id=?""", (message_id, channel_id)
             )
 
+    def add_media_batch(
+        self, channel: Channel, records: list[MediaRecord], priority: int,
+    ) -> int:
+        if not records:
+            return 0
+        inserted_count = 0
+        changed = False
+        with self.connect() as conn:
+            conn.execute(
+                """UPDATE channels SET last_seen_message_id=MAX(last_seen_message_id, ?)
+                   WHERE id=?""",
+                (max(record.message_id for record in records), channel.id),
+            )
+            for record in records:
+                if record.file_name is None:
+                    continue
+                if (
+                    (record.duration_seconds > 0
+                     and record.duration_seconds < channel.min_duration_seconds)
+                    or record.size_bytes < channel.min_size_bytes
+                ):
+                    continue
+                if (
+                    channel.media_types
+                    and Path(record.file_name).suffix.lower() not in channel.media_types
+                ):
+                    continue
+                cur = conn.execute(
+                    """INSERT OR IGNORE INTO media(
+                       channel_id,message_id,telegram_document_id,file_name,size_bytes,
+                       duration_seconds,message_date,priority) VALUES(?,?,?,?,?,?,?,?)""",
+                    (channel.id, record.message_id, record.document_id, record.file_name,
+                     record.size_bytes, record.duration_seconds, record.message_date, priority),
+                )
+                inserted_count += int(cur.rowcount > 0)
+                changed = changed or cur.rowcount > 0
+                if priority == 0:
+                    changed = bool(conn.execute(
+                        """UPDATE media SET priority=0 WHERE channel_id=? AND message_id=?
+                           AND status='queued'""", (channel.id, record.message_id)
+                    ).rowcount) or changed
+        if changed:
+            self._bump_revision()
+        return inserted_count
+
     def add_media(self, *, channel: Channel, message_id: int, document_id: int | None,
                   file_name: str, size_bytes: int, duration_seconds: int,
                   message_date: str, priority: int) -> bool:
-        if ((duration_seconds > 0 and duration_seconds < channel.min_duration_seconds)
-                or size_bytes < channel.min_size_bytes):
-            return False
-        if channel.media_types and Path(file_name).suffix.lower() not in channel.media_types:
-            return False
-        with self.connect() as conn:
-            cur = conn.execute(
-                """INSERT OR IGNORE INTO media(
-                   channel_id,message_id,telegram_document_id,file_name,size_bytes,
-                   duration_seconds,message_date,priority) VALUES(?,?,?,?,?,?,?,?)""",
-                (channel.id, message_id, document_id, file_name, size_bytes,
-                 duration_seconds, message_date, priority),
-            )
-            inserted = cur.rowcount > 0
-            if priority == 0:
-                # A live event may race the historical scanner. Promote the already-seen
-                # row so it still gets new-item priority without creating a duplicate.
-                conn.execute(
-                    """UPDATE media SET priority=0 WHERE channel_id=? AND message_id=?
-                       AND status='queued'""", (channel.id, message_id)
-                )
-        if inserted or priority == 0:
-            self._bump_revision()
-        return inserted
+        return self.add_media_batch(
+            channel,
+            [MediaRecord(
+                message_id, document_id, file_name, size_bytes, duration_seconds, message_date,
+            )],
+            priority,
+        ) > 0
 
     def next_queued(self) -> sqlite3.Row | None:
         with self.connect() as conn:
@@ -511,6 +569,19 @@ class Database:
                 "SELECT COUNT(*) count FROM media WHERE channel_id=? AND status=?", (channel_id, status)
             ).fetchone()
             return int(row["count"])
+
+    def tab_counts(self, channel_id: int) -> dict[str, int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT status, COUNT(*) count FROM media
+                   WHERE channel_id=? GROUP BY status""", (channel_id,)
+            ).fetchall()
+        by_status = {str(row["status"]): int(row["count"]) for row in rows}
+        return {
+            "queue": by_status.get("queued", 0) + by_status.get("downloading", 0),
+            "downloaded": by_status.get("downloaded", 0),
+            "failed": by_status.get("failed", 0),
+        }
 
     def pending_count(self, channel_id: int) -> int:
         with self.connect() as conn:
