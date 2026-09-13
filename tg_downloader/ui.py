@@ -1106,45 +1106,45 @@ class ChannelPanel(ttk.Frame):
         self.stats = tk.StringVar()
         self.icons = getattr(parent.winfo_toplevel(), "icons", {})
 
-        header = ttk.Frame(self, style="Content.TFrame")
-        header.pack(fill="x", pady=(0, 12))
-        self.avatar_label = ttk.Label(header, style="Content.TLabel")
-        self.avatar_label.pack(side="left", padx=(0, 11))
+        summary = ttk.Frame(self, style="Content.TFrame")
+        summary.pack(fill="x", pady=(0, 12))
+        summary.columnconfigure(1, weight=1)
+        self.avatar_label = ttk.Label(summary, style="Content.TLabel")
+        self.avatar_label.grid(row=0, column=0, rowspan=4, sticky="nw", padx=(0, 16))
         self.set_avatar()
+
+        title_row = ttk.Frame(summary, style="Content.TFrame")
+        title_row.grid(row=0, column=1, sticky="ew")
         ttk.Label(
-            header, textvariable=self.title_text, style="ChannelTitle.TLabel",
+            title_row, textvariable=self.title_text, style="ChannelTitle.TLabel",
         ).pack(side="left", padx=(0, 18))
         self.channel_pause_button = IconButton(
-            header, "play" if channel.paused else "pause",
+            title_row, "play" if channel.paused else "pause",
             "Resume channel" if channel.paused else "Pause channel",
             command=self.toggle_channel_pause,
         )
         self.channel_pause_button.pack(side="right", padx=(0, 6))
         self.remove_channel_button = IconButton(
-            header, "remove", "Remove channel", command=self.remove_channel,
+            title_row, "remove", "Remove channel", command=self.remove_channel,
         )
         self.remove_channel_button.pack(side="right", padx=(0, 6))
         self.rescan_button = IconButton(
-            header, "refresh", "Check for new files", command=self.rescan,
+            title_row, "refresh", "Check for new files", command=self.rescan,
         )
         self.rescan_button.pack(side="right", padx=(0, 6))
         self.channel_priority_down_button = IconButton(
-            header, "priority-down", "Lower channel priority",
+            title_row, "priority-down", "Lower channel priority",
             command=lambda: self.shift_channel_priority(1),
         )
         self.channel_priority_down_button.pack(side="right", padx=(0, 6))
         self.channel_priority_up_button = IconButton(
-            header, "priority-up", "Raise channel priority",
+            title_row, "priority-up", "Raise channel priority",
             command=lambda: self.shift_channel_priority(-1),
         )
         self.channel_priority_up_button.pack(side="right", padx=(0, 6))
-        self.progress = BlueProgressBar(header)
-        self.progress.pack(side="left", fill="x", expand=True, padx=(0, 12))
 
-        self.details = ttk.Frame(self, style="Content.TFrame")
-        self.details.pack(fill="both", expand=True)
-        current_row = ttk.Frame(self.details, style="Content.TFrame")
-        current_row.pack(fill="x", pady=(0, 5))
+        current_row = ttk.Frame(summary, style="Content.TFrame")
+        current_row.grid(row=1, column=1, sticky="ew", pady=(7, 0))
         current_row.columnconfigure(0, weight=1)
         ttk.Label(
             current_row, textvariable=self.current, width=1, anchor="w", style="Content.TLabel",
@@ -1161,9 +1161,14 @@ class ChannelPanel(ttk.Frame):
             current_row, textvariable=self.speed_text, width=11,
             anchor="w", style="Muted.TLabel",
         ).grid(row=0, column=3, sticky="w")
+        self.progress = BlueProgressBar(summary)
+        self.progress.grid(row=2, column=1, sticky="ew", pady=(7, 0))
         ttk.Label(
-            self.details, textvariable=self.stats, style="Muted.TLabel",
-        ).pack(fill="x", pady=(0, 12))
+            summary, textvariable=self.stats, style="Muted.TLabel",
+        ).grid(row=3, column=1, sticky="ew", pady=(7, 0))
+
+        self.details = ttk.Frame(self, style="Content.TFrame")
+        self.details.pack(fill="both", expand=True)
         self.notebook = RoundedNotebook(self.details)
         self.notebook.pack(fill="both", expand=True)
         self.make_tab("queue", ("name", "duration", "size", "status", "date_added"))
@@ -1172,7 +1177,7 @@ class ChannelPanel(ttk.Frame):
         self.notebook.bind("<<NotebookTabChanged>>", self.tab_changed)
 
     def set_avatar(self) -> None:
-        self.avatar_image = self.avatar_store.get(self.channel, 42)
+        self.avatar_image = self.avatar_store.get(self.channel, 104)
         self.avatar_label.configure(image=self.avatar_image)
 
     def make_tab(self, kind: str, columns: tuple[str, ...]) -> None:
