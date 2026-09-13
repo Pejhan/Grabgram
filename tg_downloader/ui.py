@@ -25,6 +25,7 @@ try:
         save_mtproto_proxy,
     )
     from .proxy_check import check_mtproto_proxy, sanitized_proxy_error
+    from .ui_performance import HEARTBEAT_INTERVAL_MS, UiPerformanceRecorder
 except ImportError:
     from config import Config
     from database import Channel, Database, priority_name
@@ -35,6 +36,7 @@ except ImportError:
         save_mtproto_proxy,
     )
     from proxy_check import check_mtproto_proxy, sanitized_proxy_error
+    from ui_performance import HEARTBEAT_INTERVAL_MS, UiPerformanceRecorder
 
 
 ICON_NAMES = (
@@ -1487,7 +1489,10 @@ class SidebarChannelItem(tk.Frame):
 
 
 class DownloaderApp(tk.Tk):
-    def __init__(self, config: Config, db: Database):
+    def __init__(
+        self, config: Config, db: Database, performance_report: Path | None = None,
+        performance_label: str = "",
+    ):
         super().__init__()
         configure_application_theme(self)
         self.app_icon_images = apply_application_icon(self)
@@ -1505,6 +1510,8 @@ class DownloaderApp(tk.Tk):
         self.authentication_busy = True
         self.closing = False
         self.poll_job: str | None = None
+        self.performance_job: str | None = None
+        self.performance: UiPerformanceRecorder | None = None
         self.position_revision = -1
         self.cached_positions: dict[int, int] = {}
         self.engine = DownloaderEngine(config, db, lambda name, payload: self.events.put((name, payload)))
@@ -1515,8 +1522,18 @@ class DownloaderApp(tk.Tk):
         self.build_toolbar()
         self.build_scroller()
         self.sync_cards()
+        if performance_report is not None:
+            self.performance = UiPerformanceRecorder(performance_report, performance_label)
         self.poll_job = self.after(100, self.poll)
+        if self.performance is not None:
+            self.performance_job = self.after(HEARTBEAT_INTERVAL_MS, self._performance_heartbeat)
         self.engine.start()
+
+    def _performance_heartbeat(self) -> None:
+        if self.closing or self.performance is None:
+            return
+        self.performance.record_heartbeat()
+        self.performance_job = self.after(HEARTBEAT_INTERVAL_MS, self._performance_heartbeat)
 
     def build_toolbar(self) -> None:
         toolbar = ttk.Frame(self, padding=(16, 10), style="Topbar.TFrame")
@@ -1851,19 +1868,38 @@ class DownloaderApp(tk.Tk):
     def poll(self) -> None:
         if self.closing:
             return
+        started = time.perf_counter()
+        queue_before = self.events.qsize()
+        events_handled = 0
         try:
             while True:
                 event, data = self.events.get_nowait()
                 self.handle_event(event, data)
+                events_handled += 1
         except queue.Empty:
             pass
+        events_finished = time.perf_counter()
         self.sync_cards()
+        cards_finished = time.perf_counter()
         revision = self.db.revision
         if revision != self.position_revision:
             self.cached_positions = self.db.queue_positions()
             self.position_revision = revision
+        positions_finished = time.perf_counter()
         if self.selected_channel_id in self.cards:
             self.cards[self.selected_channel_id].refresh(self.cached_positions)
+        finished = time.perf_counter()
+        if self.performance is not None:
+            self.performance.record_poll(
+                total_ms=(finished - started) * 1000,
+                events_ms=(events_finished - started) * 1000,
+                cards_ms=(cards_finished - events_finished) * 1000,
+                positions_ms=(positions_finished - cards_finished) * 1000,
+                panel_ms=(finished - positions_finished) * 1000,
+                events_handled=events_handled,
+                queue_before=queue_before,
+                queue_after=self.events.qsize(),
+            )
         self.poll_job = self.after(1000, self.poll)
 
     def close(self) -> None:
@@ -1876,12 +1912,25 @@ class DownloaderApp(tk.Tk):
             except tk.TclError:
                 pass
             self.poll_job = None
+        if self.performance_job is not None:
+            try:
+                self.after_cancel(self.performance_job)
+            except tk.TclError:
+                pass
+            self.performance_job = None
         try:
             self.engine.stop()
         finally:
-            self.destroy()
+            try:
+                if self.performance is not None:
+                    self.performance.write_report()
+            finally:
+                self.destroy()
 
 
-def create_application(config: Config, db: Database) -> DownloaderApp:
+def create_application(
+    config: Config, db: Database, performance_report: Path | None = None,
+    performance_label: str = "",
+) -> DownloaderApp:
     set_windows_app_identity()
-    return DownloaderApp(config, db)
+    return DownloaderApp(config, db, performance_report, performance_label)

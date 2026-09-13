@@ -17,6 +17,14 @@ except ImportError:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Channel Media Downloader desktop application")
     parser.add_argument("--config", type=Path, default=Path("config.json"))
+    parser.add_argument(
+        "--ui-performance-report", type=Path,
+        help="write UI responsiveness measurements to this JSON file when the app closes",
+    )
+    parser.add_argument(
+        "--ui-performance-label", default="",
+        help="label stored in the UI performance report (for example: baseline or optimized)",
+    )
     args = parser.parse_args()
     try:
         if __package__:
@@ -38,7 +46,9 @@ def main() -> None:
         config = load_config(args.config.resolve())
         instance_lock = InstanceLock(config.database_file.with_suffix(".instance.lock"))
         database = Database(config.database_file)
-        application = create_application(config, database)
+        application = create_application(
+            config, database, args.ui_performance_report, args.ui_performance_label,
+        )
         application.mainloop()
         exit_code = 0
     except Exception as exc:
