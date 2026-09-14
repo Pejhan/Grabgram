@@ -94,6 +94,7 @@ class DownloaderEngine:
         self._active_media_id: int | None = None
         self._active_channel_id: int | None = None
         self._removed_channel_media_id: int | None = None
+        self._removed_media_ids: set[int] = set()
         self._filtered_channel_media_id: int | None = None
         self._removed_channel_ids: set[int] = set()
         self._paused_channel_ids = {channel.id for channel in db.channels(True) if channel.paused}
@@ -434,6 +435,22 @@ class DownloaderEngine:
                     self._removed_channel_media_id = self._active_media_id
                     task.cancel()
                 self._emit("channel_removed", channel_id=channel_id)
+            elif name == "remove_media":
+                media_ids = {int(media_id) for media_id in data.get("media_ids", [])}
+                self.db.remove_media(list(media_ids))
+                task = self._active_download_task
+                if (
+                    self._active_media_id in media_ids
+                    and task is not None and not task.done()
+                ):
+                    self._removed_media_ids.add(int(self._active_media_id))
+                    task.cancel()
+                self._emit("queue_changed", channel_id=int(data["channel_id"]))
+            elif name == "restore_media":
+                self.db.restore_removed_media([
+                    int(media_id) for media_id in data.get("media_ids", [])
+                ])
+                self._emit("queue_changed", channel_id=int(data["channel_id"]))
 
     async def _wait_until_channel_ready(self, channel_id: int) -> None:
         """Wait for both the global and channel-specific download controls."""
@@ -753,9 +770,17 @@ class DownloaderEngine:
             if expected and offset != expected:
                 raise RuntimeError(f"Incomplete download: received {offset} of {expected} bytes")
             partial.replace(output)
-            self.db.mark_downloaded(media_id, str(output), offset)
-            self._emit("download_finished", media_id=media_id, channel_id=row["channel_id"])
+            if self.db.mark_downloaded(media_id, str(output), offset):
+                self._emit("download_finished", media_id=media_id, channel_id=row["channel_id"])
+            else:
+                # The UI may have removed the item just before the worker's
+                # cancellation command arrived. Never retain that completed file.
+                output.unlink(missing_ok=True)
         except asyncio.CancelledError:
+            if media_id in self._removed_media_ids:
+                self._discard_partial(partial)
+                self._removed_media_ids.discard(media_id)
+                return
             if self._removed_channel_media_id == media_id:
                 self._discard_partial(partial)
                 self.db.reset_active_download(media_id)

@@ -422,5 +422,55 @@ class RemoveChannelDownloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(db.channels()[0].enabled)
 
 
+class RemoveMediaDownloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_removing_active_file_cancels_download_and_discards_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = Database(root / "test.sqlite3")
+            channel_id = db.add_channel("test", 123, "Test", "Test", 0, 0)
+            channel = db.channels()[0]
+            db.add_media(
+                channel=channel, message_id=1, document_id=1, file_name="song.mp3",
+                size_bytes=1_000, duration_seconds=10,
+                message_date="2026-01-01T00:00:00+00:00", priority=10,
+            )
+            row = db.claim_next_queued()
+            config = Config(1, "hash", root / "session", db.path, root / "downloads")
+            partial = config.download_root / channel.folder / "song [1].mp3.part"
+            partial.parent.mkdir(parents=True)
+            partial.write_bytes(b"partial")
+
+            engine = DownloaderEngine(config, db, lambda *_args: None)
+            engine._running = asyncio.Event()
+            engine._running.set()
+            engine._commands = asyncio.Queue()
+
+            class BlockingClient:
+                async def get_messages(self, *_args, **_kwargs):
+                    await asyncio.Event().wait()
+
+            engine._client = BlockingClient()
+            download_task = asyncio.create_task(engine._download_one(row))
+            engine._active_download_task = download_task
+            engine._active_media_id = int(row["id"])
+            engine._active_channel_id = channel_id
+            command_task = asyncio.create_task(engine._command_loop())
+            await asyncio.sleep(0)
+
+            await engine._commands.put((
+                "remove_media",
+                {"channel_id": channel_id, "media_ids": [int(row["id"])]},
+            ))
+            await asyncio.wait_for(download_task, timeout=0.3)
+            command_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await command_task
+
+            removed = db.removed_media_for_channel(channel_id)
+            self.assertEqual([int(row["id"])], [int(item["id"]) for item in removed])
+            self.assertFalse(partial.exists())
+            self.assertIsNone(db.next_queued())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,7 +11,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import font as tkfont
 from tkinter import messagebox, simpledialog, ttk
-from typing import Any
+from typing import Any, Callable
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 
@@ -854,7 +854,8 @@ class MediaTable(ttk.Frame):
         "error": ("Error", 330),
     }
 
-    def __init__(self, parent: tk.Misc, columns: tuple[str, ...]):
+    def __init__(self, parent: tk.Misc, columns: tuple[str, ...],
+                 on_sort: Callable[[str], None] | None = None):
         super().__init__(parent)
         self.columns = columns
         self.icons = getattr(parent.winfo_toplevel(), "icons", {})
@@ -868,7 +869,10 @@ class MediaTable(ttk.Frame):
         self.tree.column("#0", width=22, minwidth=18, stretch=False, anchor="center")
         for column in columns:
             label, width = self.COLUMN_DEFINITIONS[column]
-            self.tree.heading(column, text=label)
+            self.tree.heading(
+                column, text=label,
+                command=(lambda selected=column: on_sort(selected)) if on_sort else None,
+            )
             self.tree.column(column, width=width, minwidth=60, stretch=column in {"name", "error"})
         yscroll = AutoScrollbar(self, orient="vertical", command=self.tree.yview)
         xscroll = AutoScrollbar(self, orient="horizontal", command=self.tree.xview)
@@ -879,6 +883,13 @@ class MediaTable(ttk.Frame):
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
         self.row_signatures: dict[str, tuple[Any, ...]] = {}
+
+    def set_sort(self, sort_column: str | None, descending: bool) -> None:
+        for column in self.columns:
+            label = self.COLUMN_DEFINITIONS[column][0]
+            if column == sort_column:
+                label += " ▼" if descending else " ▲"
+            self.tree.heading(column, text=label)
 
     def selected_ids(self) -> list[int]:
         return [int(item) for item in self.tree.selection()]
@@ -1079,7 +1090,7 @@ class ActiveDownloadIndicator(tk.Canvas):
 
 
 class ChannelPanel(ttk.Frame):
-    PAGE_SIZES = {"queue": 200, "downloaded": 100, "failed": 100}
+    PAGE_SIZES = {"queue": 200, "downloaded": 100, "failed": 100, "removed": 100}
     SPEED_WINDOW_SECONDS = 5.0
 
     def __init__(
@@ -1090,13 +1101,16 @@ class ChannelPanel(ttk.Frame):
         self.channel, self.db, self.engine = channel, db, engine
         self.avatar_store = avatar_store
         self.title_text = tk.StringVar(value=channel.title)
-        self.page_numbers = {"queue": 0, "downloaded": 0, "failed": 0}
+        self.page_numbers = {kind: 0 for kind in self.PAGE_SIZES}
         self.tables: dict[str, MediaTable] = {}
         self.page_labels: dict[str, tk.StringVar] = {}
         self.tab_indexes: dict[str, int] = {}
-        self.table_revisions = {"queue": -1, "downloaded": -1, "failed": -1}
+        self.table_revisions = {kind: -1 for kind in self.PAGE_SIZES}
         self.count_revision = -1
-        self.cached_counts = {"queue": 0, "downloaded": 0, "failed": 0}
+        self.cached_counts = {kind: 0 for kind in self.PAGE_SIZES}
+        self.sort_columns: dict[str, str | None] = {kind: None for kind in self.PAGE_SIZES}
+        self.sort_descending = {kind: False for kind in self.PAGE_SIZES}
+        self.search_query = ""
         self.cached_positions: dict[int, int] = {}
         self.last_active_id: int | None = None
         self.speed_samples: deque[tuple[float, int]] = deque()
@@ -1174,7 +1188,17 @@ class ChannelPanel(ttk.Frame):
         self.make_tab("queue", ("name", "duration", "size", "status", "date_added"))
         self.make_tab("downloaded", ("name", "duration", "size", "date_downloaded"))
         self.make_tab("failed", ("name", "duration", "size", "date_added", "error"))
+        self.make_tab("removed", ("name", "duration", "size", "date_added"))
         self.notebook.bind("<<NotebookTabChanged>>", self.tab_changed)
+
+    def set_search_query(self, search_query: str) -> None:
+        normalized = search_query.strip()
+        if normalized == self.search_query:
+            return
+        self.search_query = normalized
+        self.page_numbers = {kind: 0 for kind in self.PAGE_SIZES}
+        self.table_revisions = {kind: -1 for kind in self.PAGE_SIZES}
+        self.count_revision = -1
 
     def set_avatar(self) -> None:
         self.avatar_image = self.avatar_store.get(self.channel, 104)
@@ -1183,11 +1207,14 @@ class ChannelPanel(ttk.Frame):
     def make_tab(self, kind: str, columns: tuple[str, ...]) -> None:
         page = ttk.Frame(self.notebook, padding=(0, 8, 0, 0), style="Content.TFrame")
         self.tab_indexes[kind] = len(self.tab_indexes)
-        icon_name = "success" if kind == "downloaded" else kind
+        icon_name = "success" if kind == "downloaded" else "remove" if kind == "removed" else kind
         self.notebook.add(
             page, text=kind.capitalize(), image=self.icons.get(icon_name), compound="left",
         )
-        table = MediaTable(page, columns)
+        table = MediaTable(
+            page, columns,
+            lambda column, selected=kind: self.sort_list(selected, column),
+        )
         self.tables[kind] = table
         table.pack(fill="both", expand=True)
         controls = ttk.Frame(page, style="Content.TFrame")
@@ -1196,14 +1223,24 @@ class ChannelPanel(ttk.Frame):
             ttk.Button(controls, text="Redownload selected", command=self.redownload).pack(side="left")
         elif kind == "failed":
             ttk.Button(controls, text="Retry failed", command=self.retry_failed).pack(side="left")
-        IconButton(
-            controls, "priority-up", "Raise selected files priority",
-            command=lambda selected=kind: self.shift_selected_file_priority(selected, -1),
-        ).pack(side="left", padx=(0 if kind == "queue" else 6, 0))
-        IconButton(
-            controls, "priority-down", "Lower selected files priority",
-            command=lambda selected=kind: self.shift_selected_file_priority(selected, 1),
-        ).pack(side="left", padx=(6, 0))
+        if kind in {"queue", "failed"}:
+            ttk.Button(
+                controls, text="Remove selected",
+                command=lambda selected=kind: self.remove_selected_files(selected),
+            ).pack(side="left", padx=(0 if kind == "queue" else 6, 0))
+        elif kind == "removed":
+            ttk.Button(
+                controls, text="Return to queue", command=self.restore_selected_files,
+            ).pack(side="left")
+        if kind != "removed":
+            IconButton(
+                controls, "priority-up", "Raise selected files priority",
+                command=lambda selected=kind: self.shift_selected_file_priority(selected, -1),
+            ).pack(side="left", padx=(0 if kind == "queue" else 6, 0))
+            IconButton(
+                controls, "priority-down", "Lower selected files priority",
+                command=lambda selected=kind: self.shift_selected_file_priority(selected, 1),
+            ).pack(side="left", padx=(6, 0))
         label = tk.StringVar(value="Page 1 of 1")
         self.page_labels[kind] = label
         IconButton(
@@ -1227,6 +1264,17 @@ class ChannelPanel(ttk.Frame):
     def tab_changed(self, _event: Any = None) -> None:
         kind = self.selected_tab()
         self.table_revisions[kind] = -1
+        self.refresh(self.cached_positions)
+
+    def sort_list(self, kind: str, column: str) -> None:
+        if self.sort_columns[kind] == column:
+            self.sort_descending[kind] = not self.sort_descending[kind]
+        else:
+            self.sort_columns[kind] = column
+            self.sort_descending[kind] = False
+        self.page_numbers[kind] = 0
+        self.table_revisions[kind] = -1
+        self.tables[kind].set_sort(column, self.sort_descending[kind])
         self.refresh(self.cached_positions)
 
     def rescan(self) -> None:
@@ -1275,7 +1323,9 @@ class ChannelPanel(ttk.Frame):
                 app.sync_cards()
 
     def retry_failed(self) -> None:
-        ids = self.tables["failed"].selected_ids() or self.db.media_ids_by_status(self.channel.id, "failed")
+        ids = self.tables["failed"].selected_ids() or self.db.media_ids_by_status(
+            self.channel.id, "failed", self.search_query,
+        )
         self.db.retry(ids)
         self.refresh(self.cached_positions)
 
@@ -1288,8 +1338,32 @@ class ChannelPanel(ttk.Frame):
             self.db.retry(ids, include_downloaded=True)
             self.refresh(self.cached_positions)
 
+    def remove_selected_files(self, kind: str) -> None:
+        ids = self.tables[kind].selected_ids()
+        if not ids:
+            messagebox.showinfo("Remove files", "Select one or more files first.", parent=self)
+            return
+        if messagebox.askyesno(
+            "Remove files",
+            "Move the selected files to Removed? They will not be downloaded unless returned to the queue.",
+            parent=self,
+        ):
+            # Persist first so a nearly-complete active download cannot win the race.
+            self.db.remove_media(ids)
+            self.engine.command("remove_media", channel_id=self.channel.id, media_ids=ids)
+            self.refresh(self.db.queue_positions())
+
+    def restore_selected_files(self) -> None:
+        ids = self.tables["removed"].selected_ids()
+        if not ids:
+            messagebox.showinfo("Return files", "Select one or more removed files first.", parent=self)
+            return
+        self.engine.command("restore_media", channel_id=self.channel.id, media_ids=ids)
+
     def record_count(self, kind: str) -> int:
-        return self.db.queue_count(self.channel.id) if kind == "queue" else self.db.status_count(self.channel.id, kind)
+        if kind == "queue":
+            return self.db.queue_count(self.channel.id, self.search_query)
+        return self.db.status_count(self.channel.id, kind, self.search_query)
 
     def change_page(self, kind: str, amount: int) -> None:
         last_page = self.pages(self.record_count(kind), self.PAGE_SIZES[kind]) - 1
@@ -1312,7 +1386,7 @@ class ChannelPanel(ttk.Frame):
         )
         revision = self.db.revision
         if revision != self.count_revision:
-            self.cached_counts = self.db.tab_counts(self.channel.id)
+            self.cached_counts = self.db.tab_counts(self.channel.id, self.search_query)
             self.count_revision = revision
         counts = self.cached_counts
         title = f"{self.channel.title} (Paused)" if self.channel.paused else self.channel.title
@@ -1375,11 +1449,25 @@ class ChannelPanel(ttk.Frame):
         self.page_numbers[kind] = min(self.page_numbers[kind], page_count - 1)
         offset = self.page_numbers[kind] * page_size
         if kind == "queue":
-            rows = self.db.queued_media_for_channel(self.channel.id, page_size, offset)
+            rows = self.db.queued_media_for_channel(
+                self.channel.id, page_size, offset, self.search_query,
+                self.sort_columns[kind], self.sort_descending[kind],
+            )
         elif kind == "downloaded":
-            rows = self.db.downloaded_media_for_channel(self.channel.id, page_size, offset)
+            rows = self.db.downloaded_media_for_channel(
+                self.channel.id, page_size, offset, self.search_query,
+                self.sort_columns[kind], self.sort_descending[kind],
+            )
+        elif kind == "removed":
+            rows = self.db.removed_media_for_channel(
+                self.channel.id, page_size, offset, self.search_query,
+                self.sort_columns[kind], self.sort_descending[kind],
+            )
         else:
-            rows = self.db.failed_media_for_channel(self.channel.id, page_size, offset)
+            rows = self.db.failed_media_for_channel(
+                self.channel.id, page_size, offset, self.search_query,
+                self.sort_columns[kind], self.sort_descending[kind],
+            )
         self.tables[kind].populate(rows, positions, self.channel.paused)
         self.page_labels[kind].set(f"Page {self.page_numbers[kind] + 1} of {page_count}")
         self.table_revisions[kind] = revision
@@ -1508,8 +1596,9 @@ class SidebarChannelItem(tk.Frame):
 
     def update_channel(
         self, channel: Channel, queued: int, downloading: bool, force: bool = False,
+        match_count: int | None = None,
     ) -> None:
-        signature = (channel, int(queued), bool(downloading))
+        signature = (channel, int(queued), bool(downloading), match_count)
         if not force and signature == self.summary_signature:
             return
         self.summary_signature = signature
@@ -1517,7 +1606,8 @@ class SidebarChannelItem(tk.Frame):
         self.channel = channel
         self.avatar_image = self.avatar_store.get(channel, 34)
         self.avatar_label.configure(image=self.avatar_image)
-        self.title_label.configure(text=channel.title)
+        title = channel.title if match_count is None else f"{channel.title} ({match_count:,})"
+        self.title_label.configure(text=title)
         self.detail_label.configure(
             text="Paused" if channel.paused else f"{queued:,} queued",
         )
@@ -1562,6 +1652,9 @@ class DownloaderApp(tk.Tk):
         self.cards_revision = -1
         self.position_revision = -1
         self.cached_positions: dict[int, int] = {}
+        self.search_query = ""
+        self.search_job: str | None = None
+        self.search_text = tk.StringVar()
         self.engine = DownloaderEngine(config, db, self._enqueue_event)
         self.title("Channel Media Downloader")
         self.geometry("1280x820")
@@ -1642,6 +1735,34 @@ class DownloaderApp(tk.Tk):
         elif self.error_banner.winfo_manager():
             self.error_banner.pack_forget()
 
+    def search_changed(self, *_args: Any) -> None:
+        if self.search_job is not None:
+            self.after_cancel(self.search_job)
+        self.search_job = self.after(250, self.apply_scheduled_search)
+
+    def apply_scheduled_search(self) -> None:
+        self.search_job = None
+        self.apply_search()
+
+    def apply_search(self, _event: Any = None) -> None:
+        if self.search_job is not None:
+            self.after_cancel(self.search_job)
+            self.search_job = None
+        query = self.search_text.get().strip()
+        self.clear_search_button.configure(state="normal" if query else "disabled")
+        if query == self.search_query:
+            return
+        self.search_query = query
+        self.sync_cards(force=True)
+        if self.selected_channel_id in self.cards:
+            self.cards[self.selected_channel_id].refresh(self.cached_positions)
+
+    def clear_search(self, _event: Any = None) -> str:
+        self.search_text.set("")
+        self.apply_search()
+        self.search_entry.focus_set()
+        return "break"
+
     def build_scroller(self) -> None:
         container = ttk.Frame(self, style="App.TFrame")
         container.pack(fill="both", expand=True)
@@ -1657,6 +1778,22 @@ class DownloaderApp(tk.Tk):
             sidebar_heading, text="0", style="SidebarTitle.TLabel",
         )
         self.channel_count.pack(side="right")
+        search_area = ttk.Frame(sidebar, padding=(16, 0, 12, 10), style="Sidebar.TFrame")
+        search_area.pack(fill="x")
+        ttk.Label(
+            search_area, text="SEARCH FILE NAMES", style="SidebarTitle.TLabel",
+        ).pack(anchor="w", pady=(0, 5))
+        search_row = ttk.Frame(search_area, style="Sidebar.TFrame")
+        search_row.pack(fill="x")
+        self.search_entry = ttk.Entry(search_row, textvariable=self.search_text)
+        self.search_entry.pack(side="left", fill="x", expand=True)
+        self.search_entry.bind("<Return>", self.apply_search)
+        self.search_entry.bind("<Escape>", self.clear_search)
+        self.search_text.trace_add("write", self.search_changed)
+        self.clear_search_button = ttk.Button(
+            search_row, text="X", width=3, command=self.clear_search, state="disabled",
+        )
+        self.clear_search_button.pack(side="left", padx=(3, 0))
         self.sidebar_canvas = tk.Canvas(
             sidebar, background=SIDEBAR_BACKGROUND, highlightthickness=0, borderwidth=0,
         )
@@ -1701,6 +1838,10 @@ class DownloaderApp(tk.Tk):
         if not force and revision == self.cards_revision:
             return
         overviews = self.db.channel_overviews(True)
+        match_counts = (
+            self.db.channel_match_counts(self.search_query, enabled_only=True)
+            if self.search_query else {}
+        )
         enabled_channels = {channel.id: channel for channel, _, _ in overviews}
         for channel_id in list(self.cards):
             if channel_id not in enabled_channels:
@@ -1724,8 +1865,10 @@ class DownloaderApp(tk.Tk):
                 if card.channel != channel:
                     card.channel = channel
                     card.set_avatar()
+            card.set_search_query(self.search_query)
             self.sidebar_items[channel.id].update_channel(
                 channel, queued, downloading,
+                match_count=match_counts.get(channel.id, 0) if self.search_query else None,
             )
         self.channel_count.configure(text=str(len(overviews)))
         if self.selected_channel_id not in enabled_channels:

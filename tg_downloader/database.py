@@ -465,18 +465,26 @@ class Database:
         with self.connect() as conn:
             conn.execute("UPDATE media SET bytes_downloaded=? WHERE id=?", (downloaded, media_id))
 
-    def mark_downloaded(self, media_id: int, output_path: str, size: int) -> None:
+    def mark_downloaded(self, media_id: int, output_path: str, size: int) -> bool:
         with self.connect() as conn:
-            conn.execute(
+            changed = conn.execute(
                 """UPDATE media SET status='downloaded', bytes_downloaded=?, output_path=?,
-                   downloaded_at=CURRENT_TIMESTAMP, error=NULL WHERE id=?""", (size, output_path, media_id)
-            )
-        self._bump_revision()
+                   downloaded_at=CURRENT_TIMESTAMP, error=NULL
+                   WHERE id=? AND status='downloading'""", (size, output_path, media_id)
+            ).rowcount
+        if changed:
+            self._bump_revision()
+        return bool(changed)
 
     def mark_failed(self, media_id: int, error: str) -> None:
         with self.connect() as conn:
-            conn.execute("UPDATE media SET status='failed', error=? WHERE id=?", (error[:1000], media_id))
-        self._bump_revision()
+            changed = conn.execute(
+                """UPDATE media SET status='failed', error=?
+                   WHERE id=? AND status='downloading'""",
+                (error[:1000], media_id),
+            ).rowcount
+        if changed:
+            self._bump_revision()
 
     def requeue(self, media_id: int) -> None:
         with self.connect() as conn:
@@ -514,6 +522,37 @@ class Database:
         if changed:
             self._bump_revision()
 
+    def remove_media(self, media_ids: list[int]) -> None:
+        """Exclude queued or failed media from downloading until explicitly restored."""
+        if not media_ids:
+            return
+        marks = ",".join("?" for _ in media_ids)
+        with self.connect() as conn:
+            changed = conn.execute(
+                f"""UPDATE media SET status='removed', bytes_downloaded=0,
+                    output_path=NULL, downloaded_at=NULL, error=NULL
+                    WHERE id IN ({marks})
+                      AND status IN ('queued','downloading','failed')""",
+                [int(media_id) for media_id in media_ids],
+            ).rowcount
+        if changed:
+            self._bump_revision()
+
+    def restore_removed_media(self, media_ids: list[int]) -> None:
+        """Return explicitly removed media to the download queue."""
+        if not media_ids:
+            return
+        marks = ",".join("?" for _ in media_ids)
+        with self.connect() as conn:
+            changed = conn.execute(
+                f"""UPDATE media SET status='queued', priority=0, bytes_downloaded=0,
+                    output_path=NULL, downloaded_at=NULL, error=NULL
+                    WHERE id IN ({marks}) AND status='removed'""",
+                [int(media_id) for media_id in media_ids],
+            ).rowcount
+        if changed:
+            self._bump_revision()
+
     def media_for_channel(self, channel_id: int, limit: int = 500) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return list(conn.execute(
@@ -527,81 +566,171 @@ class Database:
     def pending_media_for_channel(self, channel_id: int, limit: int = 500, offset: int = 0) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return list(conn.execute(
-                """SELECT * FROM media WHERE channel_id=? AND status!='downloaded'
+                """SELECT * FROM media
+                   WHERE channel_id=? AND status NOT IN ('downloaded','removed')
                    ORDER BY CASE status WHEN 'downloading' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
                    priority_level, priority_rank, priority,
                    message_date DESC, id DESC LIMIT ? OFFSET ?""",
                 (channel_id, limit, offset),
             ))
 
+    @staticmethod
+    def _name_filter(search_query: str | None) -> tuple[str, tuple[str, ...]]:
+        query = (search_query or "").strip()
+        return (" AND file_name LIKE ?", (f"%{query}%",)) if query else ("", ())
+
+    @staticmethod
+    def _media_order(sort_column: str | None, descending: bool,
+                     default: str) -> str:
+        columns = {
+            "name": "file_name COLLATE NOCASE",
+            "duration": "duration_seconds",
+            "size": "size_bytes",
+            "status": "status COLLATE NOCASE",
+            "date_added": "message_date",
+            "date_downloaded": "downloaded_at",
+            "error": "error COLLATE NOCASE",
+        }
+        expression = columns.get(sort_column or "")
+        if expression is None:
+            return default
+        direction = "DESC" if descending else "ASC"
+        return f"{expression} {direction}, id {direction}"
+
     def queued_media_for_channel(self, channel_id: int, limit: int = 500,
-                                 offset: int = 0) -> list[sqlite3.Row]:
+                                 offset: int = 0,
+                                 search_query: str | None = None,
+                                 sort_column: str | None = None,
+                                 descending: bool = False) -> list[sqlite3.Row]:
+        name_sql, name_params = self._name_filter(search_query)
+        order = self._media_order(
+            sort_column, descending,
+            "CASE status WHEN 'downloading' THEN 0 ELSE 1 END, "
+            "priority_level, priority_rank, priority, message_date DESC, id DESC",
+        )
         with self.connect() as conn:
             return list(conn.execute(
-                   """SELECT * FROM media WHERE channel_id=? AND status IN ('queued','downloading')
-                   ORDER BY CASE status WHEN 'downloading' THEN 0 ELSE 1 END,
-                   priority_level, priority_rank, priority,
-                   message_date DESC, id DESC LIMIT ? OFFSET ?""",
-                (channel_id, limit, offset),
+                   f"""SELECT * FROM media WHERE channel_id=? AND status IN ('queued','downloading')
+                   {name_sql}
+                   ORDER BY {order} LIMIT ? OFFSET ?""",
+                (channel_id, *name_params, limit, offset),
             ))
 
     def failed_media_for_channel(self, channel_id: int, limit: int = 250,
-                                 offset: int = 0) -> list[sqlite3.Row]:
+                                 offset: int = 0,
+                                 search_query: str | None = None,
+                                 sort_column: str | None = None,
+                                 descending: bool = False) -> list[sqlite3.Row]:
+        name_sql, name_params = self._name_filter(search_query)
+        order = self._media_order(sort_column, descending, "message_date DESC, id DESC")
         with self.connect() as conn:
             return list(conn.execute(
-                """SELECT * FROM media WHERE channel_id=? AND status='failed'
-                   ORDER BY message_date DESC, id DESC LIMIT ? OFFSET ?""",
-                (channel_id, limit, offset),
+                f"""SELECT * FROM media WHERE channel_id=? AND status='failed'
+                   {name_sql}
+                   ORDER BY {order} LIMIT ? OFFSET ?""",
+                (channel_id, *name_params, limit, offset),
             ))
 
     def downloaded_media_for_channel(self, channel_id: int, limit: int = 250,
-                                     offset: int = 0) -> list[sqlite3.Row]:
+                                     offset: int = 0,
+                                     search_query: str | None = None,
+                                     sort_column: str | None = None,
+                                     descending: bool = False) -> list[sqlite3.Row]:
+        name_sql, name_params = self._name_filter(search_query)
+        order = self._media_order(sort_column, descending, "downloaded_at DESC, id DESC")
         with self.connect() as conn:
             return list(conn.execute(
-                """SELECT * FROM media WHERE channel_id=? AND status='downloaded'
-                   ORDER BY downloaded_at DESC, id DESC LIMIT ? OFFSET ?""",
-                (channel_id, limit, offset),
+                f"""SELECT * FROM media WHERE channel_id=? AND status='downloaded'
+                   {name_sql}
+                   ORDER BY {order} LIMIT ? OFFSET ?""",
+                (channel_id, *name_params, limit, offset),
             ))
 
-    def status_count(self, channel_id: int, status: str) -> int:
+    def removed_media_for_channel(self, channel_id: int, limit: int = 250,
+                                  offset: int = 0,
+                                  search_query: str | None = None,
+                                  sort_column: str | None = None,
+                                  descending: bool = False) -> list[sqlite3.Row]:
+        name_sql, name_params = self._name_filter(search_query)
+        order = self._media_order(sort_column, descending, "message_date DESC, id DESC")
+        with self.connect() as conn:
+            return list(conn.execute(
+                f"""SELECT * FROM media WHERE channel_id=? AND status='removed'
+                   {name_sql}
+                   ORDER BY {order} LIMIT ? OFFSET ?""",
+                (channel_id, *name_params, limit, offset),
+            ))
+
+    def status_count(self, channel_id: int, status: str,
+                     search_query: str | None = None) -> int:
+        name_sql, name_params = self._name_filter(search_query)
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) count FROM media WHERE channel_id=? AND status=?", (channel_id, status)
+                f"""SELECT COUNT(*) count FROM media
+                    WHERE channel_id=? AND status=?{name_sql}""",
+                (channel_id, status, *name_params),
             ).fetchone()
             return int(row["count"])
 
-    def tab_counts(self, channel_id: int) -> dict[str, int]:
+    def tab_counts(self, channel_id: int,
+                   search_query: str | None = None) -> dict[str, int]:
+        name_sql, name_params = self._name_filter(search_query)
         with self.connect() as conn:
             rows = conn.execute(
-                """SELECT status, COUNT(*) count FROM media
-                   WHERE channel_id=? GROUP BY status""", (channel_id,)
+                f"""SELECT status, COUNT(*) count FROM media
+                   WHERE channel_id=?{name_sql} GROUP BY status""",
+                (channel_id, *name_params),
             ).fetchall()
         by_status = {str(row["status"]): int(row["count"]) for row in rows}
         return {
             "queue": by_status.get("queued", 0) + by_status.get("downloading", 0),
             "downloaded": by_status.get("downloaded", 0),
             "failed": by_status.get("failed", 0),
+            "removed": by_status.get("removed", 0),
         }
+
+    def channel_match_counts(self, search_query: str,
+                             enabled_only: bool = False) -> dict[int, int]:
+        """Return filename-match totals for each channel using a substring LIKE."""
+        name_sql, name_params = self._name_filter(search_query)
+        enabled_sql = " AND c.enabled=1" if enabled_only else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""SELECT c.id channel_id, COUNT(m.id) count
+                    FROM channels c LEFT JOIN media m
+                      ON m.channel_id=c.id{name_sql}
+                    WHERE 1=1{enabled_sql}
+                    GROUP BY c.id""",
+                name_params,
+            ).fetchall()
+        return {int(row["channel_id"]): int(row["count"]) for row in rows}
 
     def pending_count(self, channel_id: int) -> int:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) count FROM media WHERE channel_id=? AND status!='downloaded'", (channel_id,)
+                """SELECT COUNT(*) count FROM media
+                   WHERE channel_id=? AND status NOT IN ('downloaded','removed')""",
+                (channel_id,),
             ).fetchone()
             return int(row["count"])
 
-    def queue_count(self, channel_id: int) -> int:
+    def queue_count(self, channel_id: int, search_query: str | None = None) -> int:
+        name_sql, name_params = self._name_filter(search_query)
         with self.connect() as conn:
             row = conn.execute(
-                """SELECT COUNT(*) count FROM media
-                   WHERE channel_id=? AND status IN ('queued','downloading')""", (channel_id,)
+                f"""SELECT COUNT(*) count FROM media
+                   WHERE channel_id=? AND status IN ('queued','downloading'){name_sql}""",
+                (channel_id, *name_params),
             ).fetchone()
             return int(row["count"])
 
-    def media_ids_by_status(self, channel_id: int, status: str) -> list[int]:
+    def media_ids_by_status(self, channel_id: int, status: str,
+                            search_query: str | None = None) -> list[int]:
+        name_sql, name_params = self._name_filter(search_query)
         with self.connect() as conn:
             return [int(row["id"]) for row in conn.execute(
-                "SELECT id FROM media WHERE channel_id=? AND status=?", (channel_id, status)
+                f"SELECT id FROM media WHERE channel_id=? AND status=?{name_sql}",
+                (channel_id, status, *name_params),
             )]
 
     def active_download(self, channel_id: int) -> sqlite3.Row | None:
@@ -659,6 +788,7 @@ class Database:
                 (channel_id,),
             ).fetchall()
         result: dict[str, Any] = {"queued": 0, "downloading": 0, "downloaded": 0, "failed": 0,
+                                  "removed": 0,
                                   "total": 0, "bytes": 0}
         for row in rows:
             result[row["status"]] = row["count"]

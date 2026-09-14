@@ -57,7 +57,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(2, queued)
         self.assertTrue(downloading)
         self.assertEqual(
-            {"queue": 2, "downloaded": 0, "failed": 0},
+            {"queue": 2, "downloaded": 0, "failed": 0, "removed": 0},
             self.db.tab_counts(self.channel.id),
         )
         self.assertIsNotNone(active)
@@ -285,6 +285,81 @@ class DatabaseTests(unittest.TestCase):
         self.db.retry([failed["id"]])
         self.assertEqual([], self.db.failed_media_for_channel(self.channel.id))
         self.assertEqual(2, self.db.queue_count(self.channel.id))
+
+    def test_filename_search_filters_all_tabs_counts_and_pages_with_like(self) -> None:
+        self.add(1)
+        self.add(2)
+        self.add(3)
+        rows = {int(row["message_id"]): row for row in self.db.media_for_channel(self.channel.id)}
+        self.db.mark_downloading(int(rows[1]["id"]))
+        self.db.mark_downloaded(int(rows[1]["id"]), "song-1.mp3", 5_000)
+        self.db.mark_downloading(int(rows[2]["id"]))
+        self.db.mark_failed(int(rows[2]["id"]), "test failure")
+
+        self.assertEqual(
+            {"queue": 1, "downloaded": 1, "failed": 1, "removed": 0},
+            self.db.tab_counts(self.channel.id, "SONG-"),
+        )
+        self.assertEqual(1, len(self.db.queued_media_for_channel(self.channel.id, search_query="-3.")))
+        self.assertEqual(1, len(self.db.downloaded_media_for_channel(self.channel.id, search_query="ong-1")))
+        self.assertEqual(1, len(self.db.failed_media_for_channel(self.channel.id, search_query="song-2")))
+        self.assertEqual([], self.db.failed_media_for_channel(self.channel.id, search_query="missing"))
+
+    def test_removed_media_is_persistent_skipped_and_restorable(self) -> None:
+        self.add(1)
+        self.add(2)
+        rows = {int(row["message_id"]): row for row in self.db.media_for_channel(self.channel.id)}
+        active_id = int(rows[2]["id"])
+        self.db.mark_downloading(active_id)
+
+        self.db.remove_media([active_id, int(rows[1]["id"])])
+        self.assertIsNone(self.db.next_queued())
+        self.assertEqual(0, self.db.pending_count(self.channel.id))
+        self.assertFalse(self.db.mark_downloaded(active_id, "should-not-exist.mp3", 5_000))
+        self.assertEqual(2, self.db.status_count(self.channel.id, "removed"))
+        self.assertEqual(2, len(Database(self.path).removed_media_for_channel(self.channel.id)))
+
+        self.db.restore_removed_media([int(rows[1]["id"])])
+        restored = self.db.next_queued()
+        self.assertIsNotNone(restored)
+        self.assertEqual(1, int(restored["message_id"]))
+        self.assertEqual(1, self.db.status_count(self.channel.id, "removed"))
+
+    def test_media_lists_sort_all_rows_before_pagination(self) -> None:
+        self.add(1, size=3_000)
+        self.add(2, size=9_000)
+        self.add(3, size=6_000)
+
+        ascending = self.db.queued_media_for_channel(
+            self.channel.id, limit=2, sort_column="size",
+        )
+        descending = self.db.queued_media_for_channel(
+            self.channel.id, limit=2, sort_column="size", descending=True,
+        )
+        self.assertEqual([1, 3], [int(row["message_id"]) for row in ascending])
+        self.assertEqual([2, 3], [int(row["message_id"]) for row in descending])
+
+        # Unknown values cannot be interpolated into SQL and fall back to default order.
+        default_rows = self.db.queued_media_for_channel(
+            self.channel.id, sort_column="not-a-column",
+        )
+        self.assertEqual([3, 2, 1], [int(row["message_id"]) for row in default_rows])
+
+    def test_filename_search_reports_match_count_for_every_enabled_channel(self) -> None:
+        self.add(1)
+        second_id = self.db.add_channel("second", 456, "Second", "Second", 0, 0)
+        third_id = self.db.add_channel("third", 789, "Third", "Third", 0, 0)
+        second = next(channel for channel in self.db.channels() if channel.id == second_id)
+        self.db.add_media(
+            channel=second, message_id=10, document_id=10, file_name="favorite-song.mp3",
+            size_bytes=5_000, duration_seconds=120, message_date="", priority=10,
+        )
+        self.db.set_channel_enabled(third_id, False)
+
+        self.assertEqual(
+            {self.channel.id: 1, second_id: 1},
+            self.db.channel_match_counts("song", enabled_only=True),
+        )
 
     def test_integer_setting_is_persistent(self) -> None:
         self.db.set_setting_int("speed_limit_bytes_per_second", 123_456)
