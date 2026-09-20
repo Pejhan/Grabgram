@@ -25,6 +25,7 @@ try:
         save_mtproto_proxy,
     )
     from .proxy_check import check_mtproto_proxy, sanitized_proxy_error
+    from .text_display import display_text, DisplayStringVar
     from .ui_performance import HEARTBEAT_INTERVAL_MS, UiPerformanceRecorder
 except ImportError:
     from config import Config
@@ -36,6 +37,7 @@ except ImportError:
         save_mtproto_proxy,
     )
     from proxy_check import check_mtproto_proxy, sanitized_proxy_error
+    from text_display import display_text, DisplayStringVar
     from ui_performance import HEARTBEAT_INTERVAL_MS, UiPerformanceRecorder
 
 
@@ -594,7 +596,7 @@ class SettingsDialog(tk.Toplevel):
             secret_row, text="Show", variable=self.show_secret, command=self.toggle_secret,
         )
         self.show_check.grid(row=0, column=1, padx=(8, 0))
-        self.check_status_text = tk.StringVar(value="Status has not been checked.")
+        self.check_status_text = DisplayStringVar(value="Status has not been checked.")
         self.check_status_label = ttk.Label(frame, textvariable=self.check_status_text, wraplength=560)
         self.check_status_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 2))
         ttk.Label(
@@ -929,7 +931,7 @@ class MediaTable(ttk.Frame):
             image = self.icons.get(f"{item_priority}-priority-marker")
             options: dict[str, Any] = {
                 "text": "",
-                "values": tuple(values[column] for column in self.columns),
+                "values": tuple(display_text(values[column]) for column in self.columns),
                 "tags": ("even" if row_index % 2 == 0 else "odd",),
                 "image": image or "",
             }
@@ -1100,7 +1102,7 @@ class ChannelPanel(ttk.Frame):
         super().__init__(parent, padding=(22, 18, 22, 18), style="Content.TFrame")
         self.channel, self.db, self.engine = channel, db, engine
         self.avatar_store = avatar_store
-        self.title_text = tk.StringVar(value=channel.title)
+        self.title_text = DisplayStringVar(value=channel.title)
         self.page_numbers = {kind: 0 for kind in self.PAGE_SIZES}
         self.tables: dict[str, MediaTable] = {}
         self.page_labels: dict[str, tk.StringVar] = {}
@@ -1114,10 +1116,10 @@ class ChannelPanel(ttk.Frame):
         self.cached_positions: dict[int, int] = {}
         self.last_active_id: int | None = None
         self.speed_samples: deque[tuple[float, int]] = deque()
-        self.current = tk.StringVar(value="Current file: Waiting for next file")
+        self.current = DisplayStringVar(value="Current file: Waiting for next file")
         self.progress_text = tk.StringVar(value="0%")
         self.speed_text = tk.StringVar(value="0 B/s")
-        self.stats = tk.StringVar()
+        self.stats = DisplayStringVar()
         self.icons = getattr(parent.winfo_toplevel(), "icons", {})
 
         summary = ttk.Frame(self, style="Content.TFrame")
@@ -1607,7 +1609,7 @@ class SidebarChannelItem(tk.Frame):
         self.avatar_image = self.avatar_store.get(channel, 34)
         self.avatar_label.configure(image=self.avatar_image)
         title = channel.title if match_count is None else f"{channel.title} ({match_count:,})"
-        self.title_label.configure(text=title)
+        self.title_label.configure(text=display_text(title))
         self.detail_label.configure(
             text="Paused" if channel.paused else f"{queued:,} queued",
         )
@@ -1719,9 +1721,9 @@ class DownloaderApp(tk.Tk):
             toolbar, text="Sign in", command=self.toggle_authentication, state="disabled",
         )
         self.auth_button.pack(side="right", padx=(6, 10))
-        self.account_status = tk.StringVar(value="Checking account…")
+        self.account_status = DisplayStringVar(value="Checking account…")
         ttk.Label(toolbar, textvariable=self.account_status, style="Topbar.TLabel").pack(side="right")
-        self.error_message = tk.StringVar()
+        self.error_message = DisplayStringVar()
         self.error_banner = ttk.Label(
             self, textvariable=self.error_message, padding=(16, 7),
             wraplength=1150, style="Error.TLabel",
