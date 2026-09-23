@@ -74,6 +74,8 @@ class DownloaderEngine:
     def __init__(self, config: Config, db: Database, callback: EventCallback):
         self.config = config
         self.db = db
+        self.download_root = Path(db.setting_text("download_root", str(config.download_root))).expanduser().resolve()
+        self.db.apply_download_root(self.download_root, config.download_root)
         self.callback = callback
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -561,7 +563,7 @@ class DownloaderEngine:
             )
 
     def _folder_path(self, folder: str) -> Path:
-        root = self.config.download_root.resolve()
+        root = self.download_root
         target = (root / folder).resolve()
         if target == root or not target.is_relative_to(root):
             raise ValueError("Channel folder must be a relative folder inside the configured download root")
@@ -732,6 +734,11 @@ class DownloaderEngine:
             if not message or downloadable is None:
                 raise RuntimeError("Telegram message or media is no longer available")
             expected = int(row["size_bytes"])
+            if row["restart_download"]:
+                # Discard destination partial data once, then resume normally on later retries.
+                with partial.open("wb"):
+                    pass
+                self.db.clear_download_restart(media_id)
             offset = partial.stat().st_size if partial.exists() else 0
             if offset > expected:
                 partial.unlink()

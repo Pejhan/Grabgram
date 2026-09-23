@@ -162,6 +162,8 @@ class Database:
                 conn.execute("ALTER TABLE channels ADD COLUMN priority_rank INTEGER NOT NULL DEFAULT 0")
                 conn.execute("UPDATE channels SET priority_rank=id")
             media_columns = {row["name"] for row in conn.execute("PRAGMA table_info(media)")}
+            if "restart_download" not in media_columns:
+                conn.execute("ALTER TABLE media ADD COLUMN restart_download INTEGER NOT NULL DEFAULT 0")
             if "priority_level" not in media_columns:
                 conn.execute("ALTER TABLE media ADD COLUMN priority_level INTEGER NOT NULL DEFAULT 1")
             if "priority_rank" not in media_columns:
@@ -501,6 +503,28 @@ class Database:
             ).rowcount
         if changed:
             self._bump_revision()
+
+    def apply_download_root(self, root: Path, default: Path) -> None:
+        """Reset unfinished transfers when a new engine adopts a different directory."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key='active_download_root'").fetchone()
+            previous = Path(row["value"]) if row else default
+            changed = previous.expanduser().resolve() != root
+            if changed:
+                conn.execute(
+                    """UPDATE media SET bytes_downloaded=0, output_path=NULL,
+                       restart_download=1 WHERE status != 'downloaded'"""
+                )
+            conn.execute(
+                """INSERT INTO settings(key,value) VALUES('active_download_root',?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (str(root),)
+            )
+        if changed:
+            self._bump_revision()
+
+    def clear_download_restart(self, media_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("UPDATE media SET restart_download=0 WHERE id=?", (media_id,))
 
     def requeue_interrupted_downloads(self) -> None:
         """Make work claimed by a stopped engine available to a replacement worker."""

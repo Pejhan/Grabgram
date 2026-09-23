@@ -5,12 +5,13 @@ import math
 import queue
 import re
 import threading
+import tempfile
 import time
 from collections import deque
 import tkinter as tk
 from pathlib import Path
 from tkinter import font as tkfont
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Callable
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
@@ -70,6 +71,10 @@ def configure_application_theme(window: tk.Tk) -> None:
     # content fill so the Clam theme does not show gray rectangles behind it.
     style.configure("TFrame", background=CONTENT_BACKGROUND)
     style.configure("TLabel", background=CONTENT_BACKGROUND, foreground=TEXT_COLOR)
+    style.configure("Settings.TLabelframe", background=CONTENT_BACKGROUND)
+    style.configure(
+        "Settings.TLabelframe.Label", background=CONTENT_BACKGROUND, foreground=TEXT_COLOR,
+    )
     style.configure("TCheckbutton", background=CONTENT_BACKGROUND, foreground=TEXT_COLOR)
     style.map(
         "TCheckbutton",
@@ -558,7 +563,7 @@ class SettingsDialog(tk.Toplevel):
         self.config = config
         self.original = load_mtproto_proxy(db)
         self.check_results: queue.Queue[tuple[bool, str]] = queue.Queue()
-        self.title("Connection settings")
+        self.title("Settings")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -569,7 +574,9 @@ class SettingsDialog(tk.Toplevel):
         self.secret = tk.StringVar(value=self.original.secret)
         self.show_secret = tk.BooleanVar()
 
-        frame = ttk.Frame(self, padding=14)
+        container = ttk.Frame(self, padding=14)
+        container.pack(fill="both", expand=True)
+        frame = ttk.LabelFrame(container, text="Proxy", padding=12, style="Settings.TLabelframe")
         frame.pack(fill="both", expand=True)
         ttk.Label(
             frame, text="Use an MTProto proxy for Telegram sign-in and media downloads.",
@@ -599,14 +606,34 @@ class SettingsDialog(tk.Toplevel):
         self.check_status_text = DisplayStringVar(value="Status has not been checked.")
         self.check_status_label = ttk.Label(frame, textvariable=self.check_status_text, wraplength=560)
         self.check_status_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 2))
+        self.check_button = ttk.Button(frame, text="Check status", command=self.check_status)
+        self.check_button.grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        saving = ttk.LabelFrame(container, text="Saving Directory", padding=12, style="Settings.TLabelframe")
+        saving.pack(fill="x", pady=(12, 0))
+        saving.columnconfigure(0, weight=1)
+        self.original_directory = db.setting_text("download_root", str(config.download_root))
+        self.saving_directory = tk.StringVar(value=self.original_directory)
+        ttk.Label(saving, text="Create each channel's folder inside:").grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 6),
+        )
+        ttk.Entry(saving, textvariable=self.saving_directory, width=58).grid(
+            row=1, column=0, sticky="ew",
+        )
+        ttk.Button(saving, text="Browse…", command=self.browse_directory).grid(
+            row=1, column=1, padx=(8, 0),
+        )
         ttk.Label(
-            frame, text="Saved changes take effect after an application restart.",
+            saving, wraplength=560,
+            text="Applies to all channels after restart. Unfinished downloads reset to 0% "
+                 "and start again in the new directory. Existing files are not moved.",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(
+            container, text="Saved changes take effect after an application restart.",
             foreground="#8a5a00",
-        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 4))
-        actions = ttk.Frame(frame)
-        actions.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        self.check_button = ttk.Button(actions, text="Check status", command=self.check_status)
-        self.check_button.pack(side="left")
+        ).pack(anchor="w", pady=(12, 0))
+        actions = ttk.Frame(container)
+        actions.pack(fill="x", pady=(10, 0))
         ttk.Button(actions, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(actions, text="Save", command=self.save).pack(side="right")
         frame.columnconfigure(1, weight=1)
@@ -672,19 +699,43 @@ class SettingsDialog(tk.Toplevel):
         if self.enabled.get():
             self.check_button.configure(state="normal")
 
+    def browse_directory(self) -> None:
+        selected = filedialog.askdirectory(
+            parent=self, title="Choose saving directory",
+            initialdir=self.saving_directory.get() or str(self.config.download_root),
+            mustexist=False,
+        )
+        if selected:
+            self.saving_directory.set(selected)
+
     def save(self) -> None:
         try:
             proxy = self.current_proxy()
-            save_mtproto_proxy(self.db, proxy)
         except (ValueError, tk.TclError) as exc:
             messagebox.showwarning("Invalid proxy settings", str(exc), parent=self)
             return
-        changed = proxy != self.original
+        try:
+            value = self.saving_directory.get().strip()
+            if not value:
+                raise ValueError("Choose a saving directory.")
+            directory = Path(value).expanduser()
+            if not directory.is_absolute():
+                raise ValueError("Choose an absolute path for the saving directory.")
+            directory = directory.resolve()
+            directory.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryFile(dir=directory):
+                pass
+        except (OSError, ValueError, RuntimeError) as exc:
+            messagebox.showwarning("Invalid saving directory", str(exc), parent=self)
+            return
+        save_mtproto_proxy(self.db, proxy)
+        self.db.set_setting_text("download_root", str(directory))
+        changed = proxy != self.original or str(directory) != self.original_directory
         self.destroy()
         if changed:
             messagebox.showinfo(
-                "Connection settings saved",
-                "Proxy settings were saved. Restart the application to use them.",
+                "Settings saved",
+                "Settings were saved. Restart the application to use them.",
                 parent=self.master,
             )
 
