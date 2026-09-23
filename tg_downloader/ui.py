@@ -115,6 +115,7 @@ def configure_application_theme(window: tk.Tk) -> None:
     )
     style.configure("Content.TLabel", background=CONTENT_BACKGROUND, foreground=TEXT_COLOR)
     style.configure("Muted.TLabel", background=CONTENT_BACKGROUND, foreground=MUTED_TEXT)
+    style.configure("Error.TFrame", background="#fce8e6")
     style.configure(
         "Error.TLabel", background="#fce8e6", foreground="#b3261e",
         font=("Segoe UI", 9),
@@ -1775,9 +1776,18 @@ class DownloaderApp(tk.Tk):
         self.account_status = DisplayStringVar(value="Checking account…")
         ttk.Label(toolbar, textvariable=self.account_status, style="Topbar.TLabel").pack(side="right")
         self.error_message = DisplayStringVar()
-        self.error_banner = ttk.Label(
-            self, textvariable=self.error_message, padding=(16, 7),
+        self.error_banner = ttk.Frame(self, padding=(16, 7), style="Error.TFrame")
+        ttk.Button(
+            self.error_banner, text="Dismiss", command=lambda: self.error_message.set(""),
+        ).pack(side="right", padx=(12, 0))
+        error_label = ttk.Label(
+            self.error_banner, textvariable=self.error_message,
             wraplength=1150, style="Error.TLabel",
+        )
+        error_label.pack(side="left", fill="x", expand=True)
+        error_label.bind(
+            "<Configure>",
+            lambda event: error_label.configure(wraplength=max(1, event.width)),
         )
         self.error_message.trace_add("write", self._update_error_banner)
 
