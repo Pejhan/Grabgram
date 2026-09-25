@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from tg_downloader.media import safe_filename, unique_output_path
+from grabgram.media import safe_filename, unique_output_path
 
 
 class MediaTests(unittest.TestCase):

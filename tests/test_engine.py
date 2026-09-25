@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tg_downloader"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "grabgram"))
 
 from config import Config
 from database import Database

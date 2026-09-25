@@ -267,7 +267,7 @@ def set_windows_app_identity() -> None:
 
         if sys.platform == "win32":
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "TelegramDownloader.ChannelMediaDownloader"
+                "Grabgram.Desktop"
             )
     except (AttributeError, OSError):
         # Other platforms and restricted Windows environments can use Tk's icon alone.
@@ -1710,7 +1710,7 @@ class DownloaderApp(tk.Tk):
         self.search_job: str | None = None
         self.search_text = tk.StringVar()
         self.engine = DownloaderEngine(config, db, self._enqueue_event)
-        self.title("Channel Media Downloader")
+        self.title("Grabgram")
         self.geometry("1280x820")
         self.minsize(900, 600)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -1747,7 +1747,7 @@ class DownloaderApp(tk.Tk):
                 toolbar, image=self.app_icon_images[-1], style="Topbar.TLabel",
             ).pack(side="left", padx=(0, 9))
         ttk.Label(
-            toolbar, text="Telegram Downloader", style="Brand.TLabel",
+            toolbar, text="Grabgram", style="Brand.TLabel",
         ).pack(side="left", padx=(0, 22))
         self.add_button = IconButton(toolbar, "add", "Add channel", command=self.add_channel)
         self.add_button.pack(side="left")

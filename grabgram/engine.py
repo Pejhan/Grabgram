@@ -109,7 +109,7 @@ class DownloaderEngine:
             return
         self._stopping = False
         self.db.requeue_interrupted_downloads()
-        self._thread = threading.Thread(target=self._thread_main, name="telegram-downloader", daemon=True)
+        self._thread = threading.Thread(target=self._thread_main, name="grabgram-downloader", daemon=True)
         self._thread.start()
 
     def _call_loop(self, callback: Callable[[], None]) -> bool:

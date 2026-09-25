@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from tg_downloader.database import Database
-from tg_downloader.proxy import (
+from grabgram.database import Database
+from grabgram.proxy import (
     DEFAULT_MTPROTO_SECRET, MtProtoProxy, canonical_proxy_secret, load_mtproto_proxy,
     parse_proxy_link, proxy_secret_kind, save_mtproto_proxy, telethon_client_options,
 )

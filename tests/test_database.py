@@ -5,7 +5,7 @@ import unittest
 import sqlite3
 from pathlib import Path
 
-from tg_downloader.database import Database, MediaRecord
+from grabgram.database import Database, MediaRecord
 
 
 class DatabaseTests(unittest.TestCase):

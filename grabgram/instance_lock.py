@@ -20,7 +20,7 @@ class InstanceLock:
         except OSError as exc:
             self._handle.close()
             self._handle = None
-            raise RuntimeError("Another Channel Media Downloader instance is already running.") from exc
+            raise RuntimeError("Another Grabgram instance is already running.") from exc
 
     def _lock(self) -> None:
         if os.name == "nt":

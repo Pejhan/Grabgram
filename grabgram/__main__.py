@@ -15,7 +15,7 @@ except ImportError:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Channel Media Downloader desktop application")
+    parser = argparse.ArgumentParser(description="Grabgram desktop application")
     parser.add_argument("--config", type=Path, default=Path("config.json"))
     parser.add_argument(
         "--ui-performance-report", type=Path,

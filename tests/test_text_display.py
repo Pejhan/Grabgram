@@ -2,13 +2,13 @@ import tkinter as tk
 import unittest
 from unittest.mock import patch
 
-from tg_downloader.text_display import DisplayStringVar, display_text
+from grabgram.text_display import DisplayStringVar, display_text
 
 
 class TextDisplayTests(unittest.TestCase):
     def setUp(self):
         display_text.cache_clear()
-        self.platform = patch("tg_downloader.text_display.sys.platform", "linux")
+        self.platform = patch("grabgram.text_display.sys.platform", "linux")
         self.platform.start()
 
     def tearDown(self):
@@ -33,7 +33,7 @@ class TextDisplayTests(unittest.TestCase):
         self.assertEqual(display_text("video_123.mp4"), "video_123.mp4")
 
     def test_native_platform_unchanged(self):
-        with patch("tg_downloader.text_display.sys.platform", "win32"):
+        with patch("grabgram.text_display.sys.platform", "win32"):
             self.assertEqual(display_text("سلام"), "سلام")
 
     def test_label_variable_shapes_initial_and_updated_values(self):

@@ -1,6 +1,7 @@
 # Local credentials and environment overrides
 config.json
 *.md
+!README.md
 .env
 .env.*
 !.env.example
@@ -40,3 +41,4 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+grbgrm-env/

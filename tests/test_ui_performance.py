@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tg_downloader.ui_performance import UiPerformanceRecorder, comparison_rows, summarize
+from grabgram.ui_performance import UiPerformanceRecorder, comparison_rows, summarize
 
 
 class FakeClock:

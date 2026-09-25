@@ -5,11 +5,11 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from tg_downloader.config import Config
-from tg_downloader.database import Database
-from tg_downloader.engine import DownloaderEngine
-from tg_downloader.proxy import MtProtoProxy
-from tg_downloader.ui import SettingsDialog
+from grabgram.config import Config
+from grabgram.database import Database
+from grabgram.engine import DownloaderEngine
+from grabgram.proxy import MtProtoProxy
+from grabgram.ui import SettingsDialog
 
 
 class SavingDirectoryTests(unittest.TestCase):
@@ -37,7 +37,7 @@ class SavingDirectoryTests(unittest.TestCase):
         running = self.engine()
         destination = self.root / 'My media'
         dialog = self.dialog(str(destination))
-        with patch('tg_downloader.ui.messagebox.showinfo'):
+        with patch('grabgram.ui.messagebox.showinfo'):
             SettingsDialog.save(dialog)
         self.assertTrue(destination.is_dir())
         self.assertEqual(running._folder_path('channel'), self.config.download_root / 'channel')
@@ -100,7 +100,7 @@ class SavingDirectoryTests(unittest.TestCase):
         for value in ('', 'relative/path', str(file)):
             with self.subTest(value=value):
                 dialog = self.dialog(value)
-                with patch('tg_downloader.ui.messagebox.showwarning') as warning:
+                with patch('grabgram.ui.messagebox.showwarning') as warning:
                     SettingsDialog.save(dialog)
                 warning.assert_called_once()
                 dialog.destroy.assert_not_called()

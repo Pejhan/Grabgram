@@ -4,9 +4,9 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from tg_downloader.config import Config
-from tg_downloader.proxy import MtProtoProxy
-from tg_downloader.proxy_check import check_mtproto_proxy, sanitized_proxy_error
+from grabgram.config import Config
+from grabgram.proxy import MtProtoProxy
+from grabgram.proxy_check import check_mtproto_proxy, sanitized_proxy_error
 
 
 class FakeClient:
