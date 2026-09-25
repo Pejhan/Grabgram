@@ -1,4 +1,4 @@
-Telethon==1.44.0
+Telethon==1.45.0
 Pillow==12.3.0
 cryptg==0.6.0
 arabic-reshaper==3.0.1
