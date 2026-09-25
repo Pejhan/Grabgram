@@ -5,10 +5,12 @@ import sys
 from pathlib import Path
 
 try:
+    from . import __version__
     from .config import load_config
     from .database import Database
     from .instance_lock import InstanceLock
 except ImportError:
+    from __init__ import __version__
     from config import load_config
     from database import Database
     from instance_lock import InstanceLock
@@ -16,6 +18,7 @@ except ImportError:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Grabgram desktop application")
+    parser.add_argument("--version", action="version", version=f"Grabgram {__version__}")
     parser.add_argument("--config", type=Path, default=Path("config.json"))
     parser.add_argument(
         "--ui-performance-report", type=Path,
