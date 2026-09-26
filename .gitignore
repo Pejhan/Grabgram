@@ -42,3 +42,9 @@ dist/
 .DS_Store
 Thumbs.db
 grbgrm-env/
+
+# Keep only the approved teaser; exclude drafts, audio alternatives, and sources
+/media/*
+!/media/teaser/
+/media/teaser/*
+!/media/teaser/grabgram-teaser-refined.mp4

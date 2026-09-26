@@ -1,5 +1,9 @@
 # <img src="assets/app-icon.svg" width="32" height="32" alt="Grabgram logo"> Grabgram
 
+<video src="media/teaser/grabgram-teaser-refined.mp4" controls width="100%">
+  <a href="media/teaser/grabgram-teaser-refined.mp4">Watch the teaser</a>
+</video>
+
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
