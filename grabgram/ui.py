@@ -20,7 +20,7 @@ try:
     from .config import Config
     from .database import Channel, Database, priority_name
     from .engine import DownloaderEngine
-    from .media import format_bytes
+    from .media import format_bytes, manual_filename
     from .proxy import (
         MtProtoProxy, ensure_telethon_compatible, load_mtproto_proxy, parse_proxy_link,
         save_mtproto_proxy,
@@ -32,7 +32,7 @@ except ImportError:
     from config import Config
     from database import Channel, Database, priority_name
     from engine import DownloaderEngine
-    from media import format_bytes
+    from media import format_bytes, manual_filename
     from proxy import (
         MtProtoProxy, ensure_telethon_compatible, load_mtproto_proxy, parse_proxy_link,
         save_mtproto_proxy,
@@ -420,6 +420,7 @@ class AddChannelDialog(tk.Toplevel):
         self.folder_separator = tk.StringVar()
         self.duration = tk.StringVar(value="1")
         self.size = tk.StringVar(value="2")
+        self.sequence_prefix = tk.BooleanVar(value=False)
         self.file_types_text = tk.StringVar(value="All file types")
         self.selected_file_types: tuple[str, ...] = ()
         self.available_file_types: list[tuple[str, int]] = []
@@ -460,10 +461,18 @@ class AddChannelDialog(tk.Toplevel):
             state="readonly", width=12,
         ).grid(row=4, column=1, sticky="w", pady=7)
 
+        ttk.Checkbutton(
+            self, text="Prefix filenames with a sequence number", variable=self.sequence_prefix,
+        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 2))
+        ttk.Label(
+            self, text="Oldest attachment first. Example: 150 attachments → 001, 002, …, 150.",
+            style="Muted.TLabel", wraplength=500,
+        ).grid(row=6, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 4))
+
         self.identifier.trace_add("write", self._identifier_changed)
         self.folder_suffix.trace_add("write", self._folder_suffix_changed)
         actions = ttk.Frame(self)
-        actions.grid(row=5, column=0, columnspan=3, sticky="e", padx=12, pady=12)
+        actions.grid(row=7, column=0, columnspan=3, sticky="e", padx=12, pady=12)
         ttk.Button(actions, text="Cancel", command=self.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(actions, text="Add channel", command=self.submit).pack(side="right")
         self.bind("<Return>", lambda _event: self.submit())
@@ -552,6 +561,7 @@ class AddChannelDialog(tk.Toplevel):
             "add_channel", identifier=identifier, folder="", folder_suffix=folder_suffix,
             min_duration_seconds=duration, min_size_bytes=size,
             media_types=self.selected_file_types,
+            sequence_prefix=self.sequence_prefix.get(),
         )
         self.destroy()
 
@@ -900,6 +910,7 @@ class RoundedNotebook(ttk.Frame):
 class MediaTable(ttk.Frame):
     COLUMN_DEFINITIONS = {
         "name": ("File name", 390),
+        "name_mode": ("Mode", 55),
         "duration": ("Duration", 85),
         "size": ("Size", 95),
         "status": ("Status", 145),
@@ -925,7 +936,7 @@ class MediaTable(ttk.Frame):
             label, width = self.COLUMN_DEFINITIONS[column]
             self.tree.heading(
                 column, text=label,
-                command=(lambda selected=column: on_sort(selected)) if on_sort else None,
+                command=(lambda selected=column: on_sort(selected)) if on_sort and column != "name_mode" else "",
             )
             self.tree.column(column, width=width, minwidth=60, stretch=column in {"name", "error"})
         yscroll = AutoScrollbar(self, orient="vertical", command=self.tree.yview)
@@ -971,7 +982,8 @@ class MediaTable(ttk.Frame):
             else:
                 display_status = status.capitalize()
             values = {
-                "name": row["file_name"],
+                "name": row["display_file_name"],
+                "name_mode": {"telegram": "O", "message": "M", "reply": "R", "manual": "C"}[row["effective_filename_mode"]],
                 "duration": f"{duration // 60:02d}:{duration % 60:02d}",
                 "size": format_bytes(size),
                 "status": display_status,
@@ -1157,6 +1169,8 @@ class ChannelPanel(ttk.Frame):
         self.title_text = DisplayStringVar(value=channel.title)
         self.page_numbers = {kind: 0 for kind in self.PAGE_SIZES}
         self.tables: dict[str, MediaTable] = {}
+        self.filename_mode_vars: dict[str, tk.StringVar] = {}
+        self.filename_menus: dict[str, tk.Menu] = {}
         self.page_labels: dict[str, tk.StringVar] = {}
         self.tab_indexes: dict[str, int] = {}
         self.table_revisions = {kind: -1 for kind in self.PAGE_SIZES}
@@ -1266,13 +1280,37 @@ class ChannelPanel(ttk.Frame):
             page, text=kind.capitalize(), image=self.icons.get(icon_name), compound="left",
         )
         table = MediaTable(
-            page, columns,
+            page, ("name", "name_mode", *columns[1:]),
             lambda column, selected=kind: self.sort_list(selected, column),
         )
         self.tables[kind] = table
         table.pack(fill="both", expand=True)
         controls = ttk.Frame(page, style="Content.TFrame")
         controls.pack(fill="x", pady=(6, 0))
+        mode_var = tk.StringVar()
+        self.filename_mode_vars[kind] = mode_var
+        menu = tk.Menu(
+            table.tree, tearoff=False,
+            postcommand=lambda selected=kind: self.refresh_filename_menu(selected),
+        )
+        for mode, label in (
+            ("telegram", "Original file name (O)"),
+            ("message", "Message text (M)"),
+            ("reply", "Replied text (R)"),
+            ("manual", "Custom name (C)…"),
+        ):
+            menu.add_radiobutton(
+                label=label, variable=mode_var, value=mode,
+                command=lambda selected=kind, value=mode: self.set_selected_filename_mode(selected, value),
+            )
+        self.filename_menus[kind] = menu
+        table.tree.bind("<Button-3>", lambda event, selected=kind: self.show_filename_menu(selected, event))
+        table.tree.bind(
+            "<Double-1>",
+            lambda event, selected=kind: self.show_filename_menu(selected, event)
+            if self.tables[selected].tree.identify_column(event.x) == "#2" else None,
+        )
+        ttk.Menubutton(controls, text="Filename mode", menu=menu).pack(side="left", padx=(0, 6))
         if kind == "downloaded":
             ttk.Button(controls, text="Redownload selected", command=self.redownload).pack(side="left")
         elif kind == "failed":
@@ -1349,6 +1387,58 @@ class ChannelPanel(ttk.Frame):
         self.db.shift_media_priority(ids, amount)
         self.table_revisions[kind] = -1
         self.refresh(self.db.queue_positions())
+
+    def refresh_filename_menu(self, kind: str) -> None:
+        rows = self.db.media_for_ids(self.channel.id, self.tables[kind].selected_ids())
+        modes = {row["filename_mode"] or row["channel_filename_mode"] for row in rows}
+        self.filename_mode_vars[kind].set(next(iter(modes)) if len(modes) == 1 else "")
+
+    def show_filename_menu(self, kind: str, event: tk.Event) -> str:
+        tree = self.tables[kind].tree
+        item = tree.identify_row(event.y)
+        if item:
+            if item not in tree.selection():
+                tree.selection_set(item)
+            tree.focus(item)
+            try:
+                self.filename_menus[kind].tk_popup(event.x_root, event.y_root)
+            finally:
+                self.filename_menus[kind].grab_release()
+        return "break"
+
+    def set_selected_filename_mode(self, kind: str, mode: str) -> None:
+        ids = self.tables[kind].selected_ids()
+        if not ids:
+            messagebox.showinfo("Filename mode", "Select one or more files first.", parent=self)
+            return
+        options: dict[str, Any] = {}
+        if mode == "manual":
+            rows = self.db.media_for_ids(self.channel.id, ids)
+            names = {}
+            for index, row in enumerate(rows, 1):
+                value = row["file_name"]
+                title = "Edit filename" if len(rows) == 1 else f"Edit filename ({index} of {len(rows)})"
+                while True:
+                    value = simpledialog.askstring(
+                        title, "Edit the current filename. The extension, sequence prefix, and message ID are kept automatically.",
+                        initialvalue=value, parent=self,
+                    )
+                    if value is None:
+                        self.refresh_filename_menu(kind)
+                        return
+                    try:
+                        names[int(row["id"])] = manual_filename(value, row["file_name"], int(row["message_id"]))
+                        break
+                    except ValueError as exc:
+                        messagebox.showwarning("Invalid filename", str(exc), parent=self)
+            options["manual_names"] = names
+        if not self.engine.command(
+            "set_media_filename_mode", channel_id=self.channel.id, media_ids=ids, filename_mode=mode,
+            **options,
+        ):
+            messagebox.showwarning(
+                "Filename mode", "The Telegram worker is not ready. Try again after it starts.", parent=self,
+            )
 
     def toggle_channel_pause(self) -> None:
         paused = not self.channel.paused
@@ -1476,7 +1566,8 @@ class ChannelPanel(ttk.Frame):
                 speed = max(0, done - sample_bytes) / elapsed if elapsed > 0 else 0.0
             percent = min(100, round(done * 100 / size)) if size else 0
             prefix = "Current file (paused)" if self.channel.paused else "Current file"
-            self.current.set(f"{prefix}: {active['file_name']}")
+            active_name = Path(active["output_path"]).name if active["output_path"] else active["file_name"]
+            self.current.set(f"{prefix}: {active_name}")
             self.progress.set_value(percent)
             self.progress_text.set(f"{percent}%    {format_bytes(done)} / {format_bytes(size)}")
             if self.channel.paused:

@@ -17,6 +17,230 @@ from engine import BandwidthLimiter, DownloaderEngine
 
 
 class MediaDiscoveryTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def naming_message(text="", reply=None):
+        return SimpleNamespace(
+            id=42, date=datetime.now(timezone.utc), message=text, is_reply=True,
+            get_reply_message=AsyncMock(return_value=reply),
+            document=SimpleNamespace(id=142, mime_type="video/mp4", size=2_000, attributes=[]),
+            photo=None,
+            file=SimpleNamespace(name="clip.mp4", ext=".mp4", size=2_000, mime_type="video/mp4"),
+        )
+
+    async def test_attached_text_takes_precedence_without_fetching_reply(self) -> None:
+        engine = object.__new__(DownloaderEngine)
+        message = self.naming_message("Summer trip", SimpleNamespace(message="Old title"))
+        record = await engine._channel_media_record(SimpleNamespace(filename_mode="message"), message)
+        self.assertEqual("Summer trip.mp4", record.file_name)
+        message.get_reply_message.assert_not_awaited()
+
+    async def test_reply_mode_uses_replied_to_message(self) -> None:
+        engine = object.__new__(DownloaderEngine)
+        message = self.naming_message(" \n ", SimpleNamespace(message="Summer trip"))
+        record = await engine._channel_media_record(SimpleNamespace(filename_mode="reply"), message)
+        self.assertEqual("Summer trip.mp4", record.file_name)
+        message.get_reply_message.assert_awaited_once()
+
+    async def test_missing_or_empty_reply_falls_back_to_telegram_filename(self) -> None:
+        engine = object.__new__(DownloaderEngine)
+        for reply in (None, SimpleNamespace(message=" \n ")):
+            message = self.naming_message(reply=reply)
+            record = await engine._channel_media_record(SimpleNamespace(filename_mode="reply"), message)
+            self.assertEqual("clip.mp4", record.file_name)
+        message = self.naming_message()
+        message.get_reply_message.side_effect = ValueError("Reply is inaccessible")
+        record = await engine._channel_media_record(SimpleNamespace(filename_mode="reply"), message)
+        self.assertEqual("clip.mp4", record.file_name)
+
+    async def test_fallback_preserves_real_filename_and_ignores_audio_metadata(self) -> None:
+        engine = object.__new__(DownloaderEngine)
+        message = self.naming_message()
+        audio = type("DocumentAttributeAudio", (), {})()
+        audio.duration, audio.title, audio.performer = 60, "Channel name", "@channel"
+        filename = type("DocumentAttributeFilename", (), {})()
+        filename.file_name = "original.mp3"
+        message.document.attributes = [audio, filename]
+        message.file.name = "original.mp3"
+        record = await engine._channel_media_record(SimpleNamespace(filename_mode="message"), message)
+        self.assertEqual("original.mp3", record.file_name)
+        filename.file_name = ""
+        record = await engine._channel_media_record(SimpleNamespace(filename_mode="message"), message)
+        self.assertEqual("original.mp3", record.file_name)
+        message.file.name = None
+        message.file.ext = ".mp3"
+        record = await engine._channel_media_record(SimpleNamespace(filename_mode="message"), message)
+        self.assertEqual("telegram-42.mp3", record.file_name)
+
+    async def test_numbered_scan_includes_live_posts_and_downloads_with_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = Database(root / "test.sqlite3")
+            db.add_channel("test", 123, "Test", "Test", 0, 0, sequence_prefix=True)
+            engine = DownloaderEngine(
+                Config(1, "hash", root / "session", db.path, root / "downloads"), db, lambda *_args: None,
+            )
+            newest = self.naming_message()
+            newest.id = 1010
+
+            class Client:
+                async def iter_messages(self, *_args, **_kwargs):
+                    for index in range(100, 0, -1):
+                        message = MediaDiscoveryTests.naming_message()
+                        message.id = index * 10
+                        yield message
+                        if index == 50:
+                            self.assert_not_ready()
+                            await engine._on_new_message(SimpleNamespace(
+                                message=newest, get_chat=AsyncMock(return_value=SimpleNamespace(id=123)),
+                            ))
+
+                def assert_not_ready(self):
+                    if db.claim_next_queued() is not None:
+                        raise AssertionError("Download began before numbering was ready")
+
+                async def get_messages(self, *_args, **_kwargs):
+                    return newest
+
+                async def iter_download(self, *_args, **_kwargs):
+                    yield b"x" * 2_000
+
+            engine._client = Client()
+            await engine._scan_channel(db.channels()[0], full=True)
+            self.assertTrue(db.channels()[0].scan_complete)
+            self.assertEqual("001 ", db.file_sequence_prefix(db.channels()[0].id, 10))
+            self.assertEqual("101 ", db.file_sequence_prefix(db.channels()[0].id, 1010))
+            row = db.claim_next_queued()
+            engine._wait_until_channel_ready = AsyncMock()
+            await engine._download_one(row)
+            expected = root / "downloads" / "Test" / "101 clip [1010].mp4"
+            self.assertEqual(b"x" * 2_000, expected.read_bytes())
+            db.retry([row["id"]], include_downloaded=True)
+            await engine._download_one(db.claim_next_queued())
+            self.assertEqual([expected], list(expected.parent.iterdir()))
+
+    async def test_failed_numbered_scan_keeps_downloads_waiting_and_resumes_full_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = Database(root / "test.sqlite3")
+            db.add_channel("test", 123, "Test", "Test", 0, 0, sequence_prefix=True)
+            events = []
+            engine = DownloaderEngine(
+                Config(1, "hash", root / "session", db.path, root / "downloads"),
+                db, lambda event, data: events.append((event, data)),
+            )
+            requests = []
+
+            class Client:
+                fail = True
+
+                async def iter_messages(self, *_args, **kwargs):
+                    requests.append(kwargs)
+                    for index in range(60, 0, -1):
+                        message = MediaDiscoveryTests.naming_message()
+                        message.id = index * 10
+                        yield message
+                        if self.fail and index == 11:
+                            raise RuntimeError("Connection lost")
+
+            engine._client = Client()
+            await engine._scan_channel(db.channels()[0], full=True)
+            self.assertFalse(db.channels()[0].scan_complete)
+            self.assertIsNone(db.claim_next_queued())
+            self.assertTrue(any(event == "error" for event, _data in events))
+            engine._client.fail = False
+            await engine._scan_channel(db.channels()[0], full=False)
+            self.assertEqual([{}, {}], requests)
+            self.assertEqual("01 ", db.file_sequence_prefix(db.channels()[0].id, 10))
+            self.assertEqual("60 ", db.file_sequence_prefix(db.channels()[0].id, 600))
+            self.assertIsNotNone(db.claim_next_queued())
+
+    async def test_numbered_partial_download_keeps_path_when_padding_grows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = Database(root / "test.sqlite3")
+            db.add_channel("test", 123, "Test", "Test", 0, 0, sequence_prefix=True)
+            channel = db.channels()[0]
+            for index in range(1, 10):
+                db.add_media(
+                    channel=channel, message_id=index, document_id=index, file_name="clip.mp4",
+                    size_bytes=8192, duration_seconds=0, message_date="", priority=10,
+                )
+            db.finalize_attachment_sequence(channel.id)
+            db.set_scan_complete(channel.id)
+            engine = DownloaderEngine(
+                Config(1, "hash", root / "session", db.path, root / "downloads"), db, lambda *_args: None,
+            )
+            offsets = []
+
+            class Client:
+                fail = True
+
+                async def get_messages(self, *_args, **_kwargs):
+                    return SimpleNamespace(document=object())
+
+                async def iter_download(self, *_args, offset, **_kwargs):
+                    offsets.append(offset)
+                    if self.fail:
+                        yield b"x" * 4096
+                        raise RuntimeError("Connection lost")
+                    yield b"y" * (8192 - offset)
+
+            engine._client = Client()
+            engine._wait_until_channel_ready = AsyncMock()
+            row = db.claim_next_queued()
+            await engine._download_one(row)
+            db.add_media(
+                channel=db.channels()[0], message_id=10, document_id=10, file_name="new.mp4",
+                size_bytes=8192, duration_seconds=0, message_date="", priority=10,
+            )
+            self.assertEqual("09 ", db.file_sequence_prefix(channel.id, 9))
+            db.retry([row["id"]])
+            engine._client.fail = False
+            await engine._download_one(db.claim_next_queued())
+            expected = root / "downloads" / "Test" / "9 clip [9].mp4"
+            self.assertEqual(b"x" * 4096 + b"y" * 4096, expected.read_bytes())
+            self.assertEqual([0, 4096], offsets)
+            db.retry([row["id"]], include_downloaded=True)
+            await engine._download_one(db.claim_next_queued())
+            self.assertEqual([expected], list(expected.parent.iterdir()))
+
+    async def test_telegram_mode_and_nonreply_do_not_fetch_reply(self) -> None:
+        engine = object.__new__(DownloaderEngine)
+        message = self.naming_message("Summer trip")
+        record = await engine._channel_media_record(SimpleNamespace(filename_mode="telegram"), message)
+        self.assertEqual("clip.mp4", record.file_name)
+        message.get_reply_message.assert_not_awaited()
+        message.message = ""
+        message.is_reply = False
+        record = await engine._channel_media_record(SimpleNamespace(filename_mode="message"), message)
+        self.assertEqual("clip.mp4", record.file_name)
+        message.get_reply_message.assert_not_awaited()
+
+    async def test_scanner_and_live_arrivals_use_channel_filename_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db = Database(root / "test.sqlite3")
+            db.add_channel("test", 123, "Test", "Test", 0, 0, filename_mode="message")
+            engine = DownloaderEngine(
+                Config(1, "hash", root / "session", db.path, root / "downloads"),
+                db, lambda *_args: None,
+            )
+            history = self.naming_message("Summer trip")
+
+            class Client:
+                async def iter_messages(self, *_args, **_kwargs):
+                    yield history
+
+            engine._client = Client()
+            await engine._scan_channel(db.channels()[0], full=True)
+            live = self.naming_message(reply=SimpleNamespace(message="Beach day"))
+            live.id = 43
+            event = SimpleNamespace(message=live, get_chat=AsyncMock(return_value=SimpleNamespace(id=123)))
+            await engine._on_new_message(event)
+            names = {row["file_name"] for row in db.media_for_channel(db.channels()[0].id)}
+            self.assertEqual({"Summer trip.mp4", "clip.mp4"}, names)
+            live.get_reply_message.assert_not_awaited()
+
     def test_extracts_audio_video_photo_and_regular_documents(self) -> None:
         video_attribute = type("DocumentAttributeVideo", (), {})()
         video_attribute.duration = 90

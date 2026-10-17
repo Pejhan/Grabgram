@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -14,12 +14,12 @@ from typing import Any, Callable
 try:
     from .config import Config
     from .database import Channel, Database, MediaRecord
-    from .media import safe_filename, unique_output_path
+    from .media import manual_filename, message_filename, safe_filename, saved_sequence_prefix, unique_output_path
     from .proxy import load_mtproto_proxy, telethon_client_options
 except ImportError:  # Supports running the module files directly as well.
     from config import Config
     from database import Channel, Database, MediaRecord
-    from media import safe_filename, unique_output_path
+    from media import manual_filename, message_filename, safe_filename, saved_sequence_prefix, unique_output_path
     from proxy import load_mtproto_proxy, telethon_client_options
 
 
@@ -99,6 +99,9 @@ class DownloaderEngine:
         self._removed_media_ids: set[int] = set()
         self._filtered_channel_media_id: int | None = None
         self._removed_channel_ids: set[int] = set()
+        self._scan_locks: dict[int, asyncio.Lock] = {}
+        self._filename_change_lock = asyncio.Lock()
+        self._renaming_media_ids: set[int] = set()
         self._paused_channel_ids = {channel.id for channel in db.channels(True) if channel.paused}
         self._limiter = BandwidthLimiter(db.setting_int("speed_limit_bytes_per_second", 0))
         self._avatar_dir = db.path.parent / "avatars"
@@ -109,6 +112,9 @@ class DownloaderEngine:
             return
         self._stopping = False
         self.db.requeue_interrupted_downloads()
+        self._scan_locks.clear()
+        self._filename_change_lock = asyncio.Lock()
+        self._renaming_media_ids.clear()
         self._thread = threading.Thread(target=self._thread_main, name="grabgram-downloader", daemon=True)
         self._thread.start()
 
@@ -239,6 +245,9 @@ class DownloaderEngine:
         if self._new_message_event is not None:
             self._client.add_event_handler(self._on_new_message, self._new_message_event())
         for channel in self.db.channels(True):
+            if channel.sequence_prefix:
+                # Reconcile missed posts before live events can append new numbers.
+                self.db.set_scan_complete(channel.id, False)
             self._track_authenticated_task(self._scan_channel(channel, full=True))
             self._track_authenticated_task(self._cache_avatar(channel))
         self._track_authenticated_task(self._download_loop())
@@ -453,6 +462,8 @@ class DownloaderEngine:
                     int(media_id) for media_id in data.get("media_ids", [])
                 ])
                 self._emit("queue_changed", channel_id=int(data["channel_id"]))
+            elif name == "set_media_filename_mode":
+                self._track_authenticated_task(self._set_media_filename_mode(**data))
 
     async def _wait_until_channel_ready(self, channel_id: int) -> None:
         """Wait for both the global and channel-specific download controls."""
@@ -465,7 +476,8 @@ class DownloaderEngine:
 
     async def _add_channel(self, identifier: str, folder: str, min_duration_seconds: int,
                            min_size_bytes: int, media_types: tuple[str, ...] = (),
-                           folder_suffix: str | None = None) -> None:
+                           folder_suffix: str | None = None,
+                           sequence_prefix: bool = False) -> None:
         try:
             entity = await self._client.get_entity(identifier)
             title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
@@ -497,7 +509,7 @@ class DownloaderEngine:
             self._folder_path(folder)
             channel_id = self.db.add_channel(
                 identifier, int(entity.id), title, folder, min_duration_seconds, min_size_bytes,
-                media_types,
+                media_types, sequence_prefix=sequence_prefix, paused=True,
             )
             task = self._active_download_task
             active_media_id = self._active_media_id
@@ -510,7 +522,7 @@ class DownloaderEngine:
                 self._filtered_channel_media_id = active_media_id
                 task.cancel()
             self._removed_channel_ids.discard(channel_id)
-            self._paused_channel_ids.discard(channel_id)
+            self._paused_channel_ids.add(channel_id)
             channel = next(c for c in self.db.channels() if c.id == channel_id)
             self._emit("channel_added", channel_id=channel_id)
             self._track_authenticated_task(self._scan_channel(channel, full=True))
@@ -597,18 +609,14 @@ class DownloaderEngine:
         telegram_file = getattr(message, "file", None)
         duration = 0
         filename = str(getattr(telegram_file, "name", "") or "")
-        performer = ""
-        title = ""
         for attr in getattr(document, "attributes", []) if document is not None else []:
             cls = type(attr).__name__
             if cls == "DocumentAttributeAudio":
                 duration = int(getattr(attr, "duration", 0) or 0)
-                performer = getattr(attr, "performer", "") or ""
-                title = getattr(attr, "title", "") or ""
             elif cls == "DocumentAttributeVideo":
                 duration = int(getattr(attr, "duration", 0) or 0)
             elif cls == "DocumentAttributeFilename":
-                filename = getattr(attr, "file_name", "") or ""
+                filename = str(getattr(attr, "file_name", "") or "").strip() or filename
         mime_type = str(
             getattr(telegram_file, "mime_type", "")
             or getattr(document, "mime_type", "")
@@ -618,8 +626,6 @@ class DownloaderEngine:
         if not extension.startswith("."):
             extension = f".{extension}" if extension else ""
         extension = extension.lower() or mimetypes.guess_extension(mime_type) or ".file"
-        if not filename and (performer or title):
-            filename = f"{performer} - {title}".strip(" -") + extension
         return MediaInfo(
             media_id=int(getattr(media, "id", 0) or 0),
             filename=safe_filename(filename, message.id, extension),
@@ -632,17 +638,38 @@ class DownloaderEngine:
         )
 
     async def _record_message(self, channel: Channel, message: Any, priority: int) -> bool:
-        record = self._media_record(message)
+        record = await self._channel_media_record(channel, message)
         added = self.db.add_media_batch(channel, [record], priority) > 0
         if added:
             self._emit("queue_changed", channel_id=channel.id)
         return added
+
+    async def _channel_media_record(self, channel: Channel, message: Any) -> MediaRecord:
+        record = self._media_record(message)
+        if record.file_name is None or channel.filename_mode == "telegram":
+            return record
+        if channel.filename_mode == "message":
+            return replace(record, file_name=record.message_file_name)
+        text = ""
+        if getattr(message, "is_reply", False):
+            try:
+                reply = await message.get_reply_message()
+                text = str(getattr(reply, "message", "") or "").strip()
+            except Exception:
+                # Deleted or inaccessible replies should not prevent saving the file.
+                pass
+        filename = message_filename(text, record.file_name, record.message_id)
+        return replace(record, file_name=filename, reply_file_name=filename)
 
     def _media_record(self, message: Any) -> MediaRecord:
         info = self._media_info(message)
         date = message.date
         if date and date.tzinfo is None:
             date = date.replace(tzinfo=timezone.utc)
+        text = str(getattr(message, "message", "") or "").strip()
+        message_name = None
+        if info:
+            message_name = message_filename(text, info.filename, int(message.id))
         return MediaRecord(
             message_id=int(message.id),
             document_id=info.media_id if info else None,
@@ -650,19 +677,32 @@ class DownloaderEngine:
             size_bytes=info.size if info else 0,
             duration_seconds=info.duration if info else 0,
             message_date=date.isoformat() if date else "",
+            telegram_file_name=info.filename if info else None,
+            message_file_name=message_name,
+            reply_file_name=info.filename if info and not getattr(message, "is_reply", False) else None,
         )
 
     async def _scan_channel(self, channel: Channel, full: bool) -> None:
+        lock = self._scan_locks.setdefault(channel.id, asyncio.Lock())
+        async with lock:
+            await self._scan_channel_locked(channel, full)
+
+    async def _scan_channel_locked(self, channel: Channel, full: bool) -> None:
         try:
             self._emit("scan", channel_id=channel.id, active=True)
             latest = next((c for c in self.db.channels() if c.id == channel.id), channel)
+            if latest.sequence_prefix and not latest.scan_complete:
+                full = True
+            channel = latest
             kwargs = {} if full else {"min_id": latest.last_seen_message_id}
+            if channel.sequence_prefix:
+                self.db.set_scan_complete(channel.id, False)
             records: list[MediaRecord] = []
             async for message in self._client.iter_messages(channel.identifier, **kwargs):
                 if channel.id in self._removed_channel_ids:
                     records.clear()
                     break
-                records.append(self._media_record(message))
+                records.append(await self._channel_media_record(channel, message))
                 if len(records) >= 50:
                     added = self.db.add_media_batch(channel, records, priority=10 if full else 0)
                     records.clear()
@@ -673,7 +713,9 @@ class DownloaderEngine:
                 added = self.db.add_media_batch(channel, records, priority=10 if full else 0)
                 if added:
                     self._emit("queue_changed", channel_id=channel.id)
-            if full:
+            if (full or channel.sequence_prefix) and channel.id not in self._removed_channel_ids:
+                if channel.sequence_prefix:
+                    self.db.finalize_attachment_sequence(channel.id)
                 self.db.set_scan_complete(channel.id)
         except asyncio.CancelledError:
             raise
@@ -698,17 +740,113 @@ class DownloaderEngine:
             # Live arrivals always precede historical backlog (but do not abort a file in progress).
             await self._record_message(channel, event.message, priority=0)
 
+    async def _set_media_filename_mode(
+        self, channel_id: int, media_ids: list[int], filename_mode: str,
+        manual_names: dict[int, str] | None = None,
+    ) -> None:
+        if filename_mode not in ("telegram", "message", "reply", "manual"):
+            self._emit("error", error=f"Unknown filename mode: {filename_mode}")
+            return
+        errors = []
+        # Downloads already in progress continue while names are fetched. New claims
+        # wait until the selected files and their destinations have been updated.
+        async with self._filename_change_lock:
+            rows = self.db.media_for_ids(channel_id, media_ids)
+            for row in rows:
+                media_id = int(row["id"])
+                try:
+                    telegram_name = row["telegram_file_name"]
+                    message_name = row["message_file_name"]
+                    reply_name = row["reply_file_name"]
+                    if filename_mode == "manual":
+                        filename = manual_filename(
+                            (manual_names or {}).get(media_id, ""), row["file_name"], int(row["message_id"]),
+                        )
+                    else:
+                        filename = {"telegram": telegram_name, "message": message_name, "reply": reply_name}[filename_mode]
+                    if filename is None:
+                        if not self._authenticated:
+                            raise RuntimeError("Sign in to Telegram to retrieve this filename")
+                        message = await self._client.get_messages(
+                            row["identifier"], ids=int(row["message_id"]),
+                        )
+                        if message is None or self._media_info(message) is None:
+                            raise RuntimeError("Telegram message or media is no longer available")
+                        channel = next(c for c in self.db.channels() if c.id == channel_id)
+                        record = await self._channel_media_record(
+                            replace(channel, filename_mode=filename_mode), message,
+                        )
+                        telegram_name = record.telegram_file_name
+                        message_name = record.message_file_name
+                        reply_name = record.reply_file_name
+                        filename = record.file_name
+                    task = self._active_download_task
+                    if self._active_media_id == media_id and task is not None and not task.done():
+                        self._renaming_media_ids.add(media_id)
+                        task.cancel()
+                        try:
+                            await task
+                        finally:
+                            self._renaming_media_ids.discard(media_id)
+                    latest = self.db.media_for_ids(channel_id, [media_id])
+                    if not latest:
+                        continue
+                    row = latest[0]
+                    if row["status"] == "downloading":
+                        raise RuntimeError("The file is still downloading; try again")
+                    self._rename_media_file(row, filename_mode, filename, telegram_name, message_name, reply_name)
+                except Exception as exc:
+                    errors.append(f"{row['file_name']}: {exc}")
+        self._emit("queue_changed", channel_id=channel_id)
+        if errors:
+            self._emit("error", error="Could not change filename mode:\n" + "\n".join(errors))
+
+    def _rename_media_file(
+        self, row: Any, mode: str, filename: str,
+        telegram_name: str | None, message_name: str | None, reply_name: str | None = None,
+    ) -> None:
+        message_id = int(row["message_id"])
+        old_base = unique_output_path(Path("."), row["file_name"], message_id).name
+        if row["output_path"]:
+            old_output = Path(row["output_path"])
+        else:
+            old_output = self._folder_path(row["folder"]) / old_base
+        # Keep the exact sequence prefix, including padding, on existing files.
+        prefix = old_output.name[:-len(old_base)] if old_output.name.endswith(old_base) else ""
+        new_output = unique_output_path(old_output.parent, filename, message_id, prefix)
+        old_partial, new_partial = Path(f"{old_output}.part"), Path(f"{new_output}.part")
+        moves = []
+        candidates = [(old_partial, new_partial)]
+        if row["output_path"]:
+            candidates.append((old_output, new_output))
+        for old, new in candidates:
+            if old != new and (new.exists() or new.is_symlink()):
+                raise FileExistsError(f"A file already exists at {new.name}")
+        try:
+            for old, new in candidates:
+                if old != new and old.exists():
+                    old.rename(new)
+                    moves.append((old, new))
+            output_path = str(new_output) if row["output_path"] or moves else None
+            self.db.set_media_filename(row, mode, filename, output_path, telegram_name, message_name, reply_name)
+        except Exception:
+            for old, new in reversed(moves):
+                new.rename(old)
+            raise
+
     async def _download_loop(self) -> None:
         while True:
             assert self._running is not None
             await self._running.wait()
-            row = self.db.claim_next_queued()
+            async with self._filename_change_lock:
+                row = self.db.claim_next_queued()
+                if row is not None:
+                    self._active_media_id = int(row["id"])
+                    self._active_channel_id = int(row["channel_id"])
+                    self._active_download_task = asyncio.create_task(self._download_one(row))
             if row is None:
                 await asyncio.sleep(0.5)
                 continue
-            self._active_media_id = int(row["id"])
-            self._active_channel_id = int(row["channel_id"])
-            self._active_download_task = asyncio.create_task(self._download_one(row))
             try:
                 await self._active_download_task
             finally:
@@ -726,7 +864,35 @@ class DownloaderEngine:
         try:
             folder = self._folder_path(row["folder"])
             folder.mkdir(parents=True, exist_ok=True)
-            output = unique_output_path(folder, row["file_name"], int(row["message_id"]))
+            wanted_prefix = self.db.file_sequence_prefix(channel_id, int(row["message_id"]))
+            output = unique_output_path(
+                folder, row["file_name"], int(row["message_id"]),
+                sequence_prefix=wanted_prefix,
+            )
+            previous_output = Path(row["output_path"]) if row["output_path"] else None
+            if previous_output is None and wanted_prefix:
+                legacy_output = unique_output_path(folder, row["file_name"], int(row["message_id"]))
+                if Path(f"{legacy_output}.part").exists():
+                    previous_output = legacy_output
+            moved_partial = None
+            if previous_output is not None and previous_output.parent.resolve() == folder:
+                previous_prefix = saved_sequence_prefix(previous_output, row["file_name"], int(row["message_id"]))
+                if not wanted_prefix or (previous_prefix and int(previous_prefix) == int(wanted_prefix)):
+                    output = previous_output
+                else:
+                    old_partial = Path(f"{previous_output}.part")
+                    new_partial = Path(f"{output}.part")
+                    if old_partial.exists() and old_partial != new_partial:
+                        if new_partial.exists() or new_partial.is_symlink():
+                            raise FileExistsError(f"A partial download already exists at {new_partial.name}")
+                        old_partial.rename(new_partial)
+                        moved_partial = (old_partial, new_partial)
+            try:
+                self.db.set_output_path(media_id, str(output))
+            except Exception:
+                if moved_partial:
+                    moved_partial[1].rename(moved_partial[0])
+                raise
             partial = Path(f"{output}.part")
             await self._wait_until_channel_ready(channel_id)
             message = await self._client.get_messages(row["identifier"], ids=int(row["message_id"]))
@@ -794,6 +960,9 @@ class DownloaderEngine:
                 return
             if self._filtered_channel_media_id == media_id:
                 self._discard_partial(partial)
+                return
+            if media_id in self._renaming_media_ids:
+                self.db.requeue(media_id)
                 return
             self.db.requeue(media_id)
             raise

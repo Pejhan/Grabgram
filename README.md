@@ -55,12 +55,48 @@ Telegram asks for your phone number, login code, and two-step verification passw
 ## 🎯 Using Grabgram
 
 1. Click **Add channel** and enter a username, `https://t.me/example` link, or accessible channel ID.
-2. Choose a folder and media filters. Set either minimum to `0` to disable that filter.
-3. Follow progress in **Queue**, **Downloaded**, **Failed**, and **Removed**.
+2. Choose a folder and media filters, and optionally enable sequence numbering.
+   Set either minimum to `0` to disable that filter.
+3. New channels start **paused** while Grabgram discovers their files. Choose filenames
+   in the file list, then click **Resume channel** to begin downloads.
+4. Follow progress in **Queue**, **Downloaded**, **Failed**, and **Removed**.
+
+Select files and open **Filename mode**, right-click a file, or double-click its
+**Mode** cell to choose:
+
+| Mode | Filename source |
+| --- | --- |
+| **Original file name (O)** | The original filename supplied by Telegram (the default). |
+| **Message text (M)** | Only the message attached to the file. |
+| **Replied text (R)** | Only the message this file replies to, even when it has an attached message. |
+| **Custom name (C)** | Edit the filename manually, starting from the name the file currently uses. |
+
+If the chosen message has no text or is unavailable, Grabgram uses the original
+filename. Unnamed Telegram files receive a generated name such as `telegram-42.jpg`.
+The file extension is kept, unsafe filename characters are cleaned, and a message ID
+prevents duplicate names: for example, `Summer trip [42].mp4`.
+
+Individual filename choices survive channel rescans. Completed files are renamed
+locally; partial downloads keep their progress and sequence prefixes. Name collisions
+are reported without overwriting another file. Sign in if the chosen text or original
+filename has not been cached yet.
+**Custom name (C)** works offline. Its editor starts with the current O, M, R, or
+custom filename; the extension, sequence prefix, and message ID are kept automatically.
 
 Use **Retry failed** for errors, **Return to queue** for removed items, and
 **Redownload** to fetch a completed item again. Deleting a local file does not
 make Grabgram download it again automatically. Pausing downloads keeps discovery running.
+
+Enable **Prefix filenames with a sequence number** to number attachments from oldest
+to newest. Numbers count all downloadable attachments in the channel, including files
+excluded by your filters. Padding follows the total attachment count: 12 attachments
+use `01`–`12`, while 150 use `001`–`150`. For example, the first file might be saved as
+`001 Summer trip [42].mp4` with any filename mode.
+
+Sequence prefixes appear in the file list after the initial channel scan finishes.
+Numbered downloads also wait for that scan to finish. New attachments continue
+the sequence; retries and resumed downloads keep their number and padding. Existing
+downloaded files keep their names. Newly started downloads use the current total for padding.
 
 ## ⚙️ Settings
 

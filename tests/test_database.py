@@ -31,6 +31,107 @@ class DatabaseTests(unittest.TestCase):
         self.assertFalse(self.add(2, size=999))
         self.assertTrue(self.add(3, duration=60, size=1_000))
 
+    def test_filename_mode_defaults_to_telegram_and_persists_on_readd(self) -> None:
+        self.assertEqual("telegram", self.channel.filename_mode)
+        channel_id = self.db.add_channel(
+            "test", 123, "Test", "Test", 60, 1_000, filename_mode="message",
+        )
+        self.assertEqual(self.channel.id, channel_id)
+        self.assertEqual("message", Database(self.path).channels()[0].filename_mode)
+
+    def test_new_channel_persists_message_filename_mode(self) -> None:
+        self.db.add_channel("second", 456, "Second", "Second", 0, 0, filename_mode="message")
+        self.assertEqual("message", Database(self.path).channel_by_telegram_id(456).filename_mode)
+
+    def test_invalid_filename_mode_does_not_change_channel(self) -> None:
+        with self.assertRaises(ValueError):
+            self.db.add_channel("test", 123, "Test", "Test", 0, 0, filename_mode="invalid")
+        self.assertEqual("telegram", self.db.channels()[0].filename_mode)
+
+    def test_sequence_counts_filtered_attachments_in_oldest_first_order(self) -> None:
+        self.db.add_channel(
+            "test", 123, "Test", "Test", 0, 0, (".mp3",), sequence_prefix=True,
+        )
+        channel = self.db.channels()[0]
+        # Telegram scans newest first, and message IDs have gaps for text-only posts.
+        records = [
+            MediaRecord(index * 10, index, f"file.{('mp3' if index % 2 == 0 else 'jpg')}", 2_000, 0, "")
+            for index in range(150, 0, -1)
+        ]
+        records.append(MediaRecord(5, None, None, 0, 0, ""))
+        for offset in range(0, len(records), 50):
+            self.db.add_media_batch(channel, records[offset:offset + 50], 10)
+        self.assertIsNone(self.db.next_queued())
+        self.assertIsNone(self.db.claim_next_queued())
+        self.db.finalize_attachment_sequence(channel.id)
+        self.assertIsNone(self.db.claim_next_queued())
+        self.db.set_scan_complete(channel.id)
+        self.assertEqual(75, len(self.db.media_for_channel(channel.id)))
+        self.assertEqual("001 ", self.db.file_sequence_prefix(channel.id, 10))
+        self.assertEqual("002 ", self.db.file_sequence_prefix(channel.id, 20))
+        self.assertEqual("150 ", self.db.file_sequence_prefix(channel.id, 1500))
+        visible = {row["message_id"]: row for row in self.db.queued_media_for_channel(channel.id)}
+        self.assertEqual("002 file [20].mp3", visible[20]["display_file_name"])
+        self.assertEqual("150 file [1500].mp3", visible[1500]["display_file_name"])
+        self.assertIsNotNone(self.db.claim_next_queued())
+        reopened = Database(self.path)
+        self.assertTrue(reopened.channels()[0].sequence_prefix)
+        self.assertEqual("001 ", reopened.file_sequence_prefix(channel.id, 10))
+        self.assertEqual("150 ", reopened.file_sequence_prefix(channel.id, 1500))
+
+    def test_sequence_appends_new_posts_and_keeps_numbers_on_duplicates_and_readd(self) -> None:
+        self.db.add_channel("test", 123, "Test", "Test", 0, 0, sequence_prefix=True)
+        channel = self.db.channels()[0]
+        records = [MediaRecord(index * 10, index, "song.mp3", 2_000, 0, "") for index in range(1, 13)]
+        self.db.add_media_batch(channel, records, 10)
+        self.db.finalize_attachment_sequence(channel.id)
+        self.db.set_scan_complete(channel.id)
+        self.assertEqual("01 ", self.db.file_sequence_prefix(channel.id, 10))
+        self.db.add_media_batch(channel, records, 10)
+        self.db.add_media_batch(channel, [MediaRecord(140, 14, "new.mp3", 2_000, 0, "")], 0)
+        self.assertEqual("13 ", self.db.file_sequence_prefix(channel.id, 140))
+        self.db.add_channel("test", 123, "Test", "Test", 0, 0, sequence_prefix=True)
+        self.assertIsNone(self.db.claim_next_queued())
+        self.db.finalize_attachment_sequence(channel.id)
+        self.db.set_scan_complete(channel.id)
+        self.assertEqual("01 ", self.db.file_sequence_prefix(channel.id, 10))
+        self.assertEqual("13 ", self.db.file_sequence_prefix(channel.id, 140))
+        self.db.add_channel("test", 123, "Test", "Test", 0, 0, sequence_prefix=False)
+        self.assertEqual("", self.db.file_sequence_prefix(channel.id, 10))
+        self.assertIsNotNone(self.db.claim_next_queued())
+
+    def test_sequence_padding_grows_with_total_and_channels_are_independent(self) -> None:
+        self.db.add_channel("test", 123, "Test", "Test", 0, 0, sequence_prefix=True)
+        channel = self.db.channels()[0]
+        self.db.add_media_batch(channel, [
+            MediaRecord(index, index, "song.mp3", 2_000, 0, "") for index in range(1, 100)
+        ], 10)
+        self.db.finalize_attachment_sequence(channel.id)
+        self.db.set_scan_complete(channel.id)
+        self.assertEqual("01 ", self.db.file_sequence_prefix(channel.id, 1))
+        self.db.add_media_batch(channel, [MediaRecord(100, 100, "song.mp3", 2_000, 0, "")], 0)
+        self.assertEqual("001 ", self.db.file_sequence_prefix(channel.id, 1))
+        self.assertEqual("100 ", self.db.file_sequence_prefix(channel.id, 100))
+        self.db.add_channel("second", 456, "Second", "Second", 0, 0, sequence_prefix=True)
+        second = self.db.channel_by_telegram_id(456)
+        self.db.add_media_batch(second, [MediaRecord(500, 500, "song.mp3", 2_000, 0, "")], 10)
+        self.db.finalize_attachment_sequence(second.id)
+        self.db.set_scan_complete(second.id)
+        self.assertEqual("1 ", self.db.file_sequence_prefix(second.id, 500))
+
+    def test_rescan_repairs_cached_names_but_preserves_partial_and_completed_files(self) -> None:
+        for message_id in (1, 2, 3):
+            self.add(message_id)
+        rows = {row["message_id"]: row for row in self.db.media_for_channel(self.channel.id)}
+        self.db.update_progress(rows[2]["id"], 100)
+        self.db.mark_downloading(rows[3]["id"])
+        self.db.mark_downloaded(rows[3]["id"], "/saved/song-3.mp3", 5_000)
+        self.db.add_media_batch(self.channel, [
+            MediaRecord(index, index, f"original-{index}.mp3", 5_000, 120, "") for index in (1, 2, 3)
+        ], 10)
+        names = {row["message_id"]: row["file_name"] for row in self.db.media_for_channel(self.channel.id)}
+        self.assertEqual({1: "original-1.mp3", 2: "song-2.mp3", 3: "song-3.mp3"}, names)
+
     def test_media_batch_uses_one_revision_and_records_latest_seen_message(self) -> None:
         before = self.db.revision
         inserted = self.db.add_media_batch(
@@ -199,6 +300,8 @@ class DatabaseTests(unittest.TestCase):
 
         migrated = Database(legacy_path)
         channel = migrated.channels()[0]
+        self.assertEqual("telegram", channel.filename_mode)
+        self.assertFalse(channel.sequence_prefix)
         self.assertEqual(1, channel.priority_level)
         self.assertEqual(channel.id, channel.priority_rank)
         with migrated.connect() as connection:

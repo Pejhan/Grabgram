@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+try:
+    from .media import saved_sequence_prefix, unique_output_path
+except ImportError:
+    from media import saved_sequence_prefix, unique_output_path
+
 
 PRIORITY_LEVELS = {"high": 0, "medium": 1, "low": 2}
 PRIORITY_NAMES = ("high", "medium", "low")
@@ -46,6 +51,8 @@ CREATE TABLE IF NOT EXISTS channels (
     enabled INTEGER NOT NULL DEFAULT 1,
     paused INTEGER NOT NULL DEFAULT 0,
     media_types TEXT NOT NULL DEFAULT '',
+    filename_mode TEXT NOT NULL DEFAULT 'telegram',
+    sequence_prefix INTEGER NOT NULL DEFAULT 0,
     priority_level INTEGER NOT NULL DEFAULT 1,
     priority_rank INTEGER NOT NULL DEFAULT 0,
     scan_complete INTEGER NOT NULL DEFAULT 0,
@@ -59,6 +66,10 @@ CREATE TABLE IF NOT EXISTS media (
     message_id INTEGER NOT NULL,
     telegram_document_id INTEGER,
     file_name TEXT NOT NULL,
+    filename_mode TEXT,
+    telegram_file_name TEXT,
+    message_file_name TEXT,
+    reply_file_name TEXT,
     size_bytes INTEGER NOT NULL DEFAULT 0,
     duration_seconds INTEGER NOT NULL DEFAULT 0,
     message_date TEXT,
@@ -79,6 +90,16 @@ ON media(status, priority, message_date DESC, id DESC);
 
 CREATE INDEX IF NOT EXISTS media_channel_status_idx
 ON media(channel_id, status);
+
+CREATE TABLE IF NOT EXISTS attachment_sequence (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL,
+    sequence_number INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(channel_id, message_id)
+);
+
+CREATE INDEX IF NOT EXISTS attachment_sequence_number_idx
+ON attachment_sequence(channel_id, sequence_number);
 
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -103,6 +124,8 @@ class Channel:
     priority_rank: int
     scan_complete: bool
     last_seen_message_id: int
+    filename_mode: str = "telegram"
+    sequence_prefix: bool = False
 
 
 @dataclass(frozen=True)
@@ -113,6 +136,9 @@ class MediaRecord:
     size_bytes: int
     duration_seconds: int
     message_date: str
+    telegram_file_name: str | None = None
+    message_file_name: str | None = None
+    reply_file_name: str | None = None
 
 
 class Database:
@@ -156,12 +182,23 @@ class Database:
                 conn.execute("ALTER TABLE channels ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
             if "media_types" not in columns:
                 conn.execute("ALTER TABLE channels ADD COLUMN media_types TEXT NOT NULL DEFAULT ''")
+            if "filename_mode" not in columns:
+                conn.execute("ALTER TABLE channels ADD COLUMN filename_mode TEXT NOT NULL DEFAULT 'telegram'")
+            if "sequence_prefix" not in columns:
+                conn.execute("ALTER TABLE channels ADD COLUMN sequence_prefix INTEGER NOT NULL DEFAULT 0")
             if "priority_level" not in columns:
                 conn.execute("ALTER TABLE channels ADD COLUMN priority_level INTEGER NOT NULL DEFAULT 1")
             if "priority_rank" not in columns:
                 conn.execute("ALTER TABLE channels ADD COLUMN priority_rank INTEGER NOT NULL DEFAULT 0")
                 conn.execute("UPDATE channels SET priority_rank=id")
             media_columns = {row["name"] for row in conn.execute("PRAGMA table_info(media)")}
+            for column in ("filename_mode", "telegram_file_name", "message_file_name"):
+                if column not in media_columns:
+                    conn.execute(f"ALTER TABLE media ADD COLUMN {column} TEXT")
+            if "reply_file_name" not in media_columns:
+                conn.execute("ALTER TABLE media ADD COLUMN reply_file_name TEXT")
+                # Older versions cached attached-or-replied text in the same column.
+                conn.execute("UPDATE media SET message_file_name=NULL")
             if "restart_download" not in media_columns:
                 conn.execute("ALTER TABLE media ADD COLUMN restart_download INTEGER NOT NULL DEFAULT 0")
             if "priority_level" not in media_columns:
@@ -187,6 +224,8 @@ class Database:
             priority_level=int(row["priority_level"]), priority_rank=int(row["priority_rank"]),
             scan_complete=bool(row["scan_complete"]),
             last_seen_message_id=int(row["last_seen_message_id"]),
+            filename_mode=str(row["filename_mode"]),
+            sequence_prefix=bool(row["sequence_prefix"]),
         )
 
     def channels(self, enabled_only: bool = False) -> list[Channel]:
@@ -222,7 +261,10 @@ class Database:
 
     def add_channel(self, identifier: str, telegram_id: int, title: str, folder: str,
                     min_duration_seconds: int, min_size_bytes: int,
-                    media_types: tuple[str, ...] = ()) -> int:
+                    media_types: tuple[str, ...] = (), filename_mode: str = "telegram",
+                    sequence_prefix: bool = False, paused: bool = False) -> int:
+        if filename_mode not in ("telegram", "message", "reply"):
+            raise ValueError(f"Unknown filename mode: {filename_mode}")
         normalized_types = tuple(sorted({
             extension if extension.startswith(".") else f".{extension}"
             for extension in (item.strip().lower() for item in media_types) if extension
@@ -237,12 +279,19 @@ class Database:
                 channel_id = int(existing["id"])
                 conn.execute(
                     """UPDATE channels SET identifier=?, telegram_id=?, title=?, folder=?,
-                       min_duration_seconds=?, min_size_bytes=?, media_types=?,
-                       enabled=1, paused=0, scan_complete=0
+                       min_duration_seconds=?, min_size_bytes=?, media_types=?, filename_mode=?,
+                       sequence_prefix=?,
+                       enabled=1, paused=?, scan_complete=0
                        WHERE id=?""",
                     (identifier, telegram_id, title, folder, min_duration_seconds,
-                     min_size_bytes, serialized_types, channel_id),
+                     min_size_bytes, serialized_types, filename_mode, int(sequence_prefix), int(paused), channel_id),
                 )
+                if sequence_prefix:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO attachment_sequence(channel_id, message_id)
+                           SELECT channel_id, message_id FROM media WHERE channel_id=?""",
+                        (channel_id,),
+                    )
                 conn.execute(
                     """DELETE FROM media WHERE channel_id=?
                        AND status<>'downloaded'
@@ -268,10 +317,11 @@ class Database:
             ).fetchone()["rank"])
             cur = conn.execute(
                 """INSERT INTO channels(identifier, telegram_id, title, folder,
-                   min_duration_seconds, min_size_bytes, media_types,
-                   priority_level, priority_rank) VALUES(?,?,?,?,?,?,?,?,?)""",
+                   min_duration_seconds, min_size_bytes, media_types, filename_mode, sequence_prefix,
+                   priority_level, priority_rank, paused) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (identifier, telegram_id, title, folder, min_duration_seconds,
-                 min_size_bytes, serialized_types, PRIORITY_LEVELS["medium"], next_rank),
+                 min_size_bytes, serialized_types, filename_mode, int(sequence_prefix),
+                 PRIORITY_LEVELS["medium"], next_rank, int(paused)),
             )
             channel_id = int(cur.lastrowid)
         self._bump_revision()
@@ -388,6 +438,11 @@ class Database:
             for record in records:
                 if record.file_name is None:
                     continue
+                if channel.sequence_prefix:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO attachment_sequence(channel_id, message_id) VALUES(?,?)",
+                        (channel.id, record.message_id),
+                    )
                 if (
                     (record.duration_seconds > 0
                      and record.duration_seconds < channel.min_duration_seconds)
@@ -402,20 +457,79 @@ class Database:
                 cur = conn.execute(
                     """INSERT OR IGNORE INTO media(
                        channel_id,message_id,telegram_document_id,file_name,size_bytes,
-                       duration_seconds,message_date,priority) VALUES(?,?,?,?,?,?,?,?)""",
+                       duration_seconds,message_date,priority,telegram_file_name,message_file_name,reply_file_name)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                     (channel.id, record.message_id, record.document_id, record.file_name,
-                     record.size_bytes, record.duration_seconds, record.message_date, priority),
+                     record.size_bytes, record.duration_seconds, record.message_date, priority,
+                     record.telegram_file_name, record.message_file_name, record.reply_file_name),
                 )
                 inserted_count += int(cur.rowcount > 0)
                 changed = changed or cur.rowcount > 0
+                # A rescan also repairs cached names before any file has been written.
+                changed = bool(conn.execute(
+                    """UPDATE media SET file_name=? WHERE channel_id=? AND message_id=?
+                       AND file_name<>? AND status IN ('queued','failed','removed')
+                       AND bytes_downloaded=0 AND output_path IS NULL AND filename_mode IS NULL""",
+                    (record.file_name, channel.id, record.message_id, record.file_name),
+                ).rowcount) or changed
+                conn.execute(
+                    """UPDATE media SET telegram_file_name=COALESCE(?,telegram_file_name),
+                       message_file_name=COALESCE(?,message_file_name), reply_file_name=COALESCE(?,reply_file_name)
+                       WHERE channel_id=? AND message_id=?""",
+                    (record.telegram_file_name, record.message_file_name, record.reply_file_name,
+                     channel.id, record.message_id),
+                )
                 if priority == 0:
                     changed = bool(conn.execute(
                         """UPDATE media SET priority=0 WHERE channel_id=? AND message_id=?
                            AND status='queued'""", (channel.id, record.message_id)
                     ).rowcount) or changed
+            if channel.sequence_prefix:
+                current = conn.execute(
+                    "SELECT scan_complete FROM channels WHERE id=?", (channel.id,),
+                ).fetchone()
+                if current and current["scan_complete"]:
+                    self._assign_attachment_sequence(conn, channel.id)
         if changed:
             self._bump_revision()
         return inserted_count
+
+    @staticmethod
+    def _assign_attachment_sequence(conn: sqlite3.Connection, channel_id: int) -> None:
+        """Append unnumbered attachments in Telegram's chronological message order."""
+        conn.execute(
+            """WITH pending AS MATERIALIZED (
+                   SELECT message_id, ROW_NUMBER() OVER (ORDER BY message_id) +
+                       (SELECT COALESCE(MAX(sequence_number), 0) FROM attachment_sequence
+                        WHERE channel_id=?) AS number
+                   FROM attachment_sequence WHERE channel_id=? AND sequence_number=0
+               )
+               UPDATE attachment_sequence SET sequence_number=(
+                   SELECT number FROM pending WHERE pending.message_id=attachment_sequence.message_id
+               ) WHERE channel_id=? AND sequence_number=0""",
+            (channel_id, channel_id, channel_id),
+        )
+
+    def finalize_attachment_sequence(self, channel_id: int) -> None:
+        with self.connect() as conn:
+            self._assign_attachment_sequence(conn, channel_id)
+        self._bump_revision()
+
+    def file_sequence_prefix(self, channel_id: int, message_id: int) -> str:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT c.sequence_prefix, s.sequence_number,
+                       (SELECT MAX(sequence_number) FROM attachment_sequence WHERE channel_id=c.id) total
+                   FROM channels c LEFT JOIN attachment_sequence s
+                     ON s.channel_id=c.id AND s.message_id=? WHERE c.id=?""",
+                (message_id, channel_id),
+            ).fetchone()
+        if row is None or not row["sequence_prefix"]:
+            return ""
+        if not row["sequence_number"]:
+            raise ValueError("Attachment sequence is not ready; finish scanning the channel first")
+        width = len(str(row["total"]))
+        return f"{int(row['sequence_number']):0{width}d} "
 
     def add_media(self, *, channel: Channel, message_id: int, document_id: int | None,
                   file_name: str, size_bytes: int, duration_seconds: int,
@@ -434,6 +548,9 @@ class Database:
                 """SELECT m.*, c.identifier, c.folder, c.title AS channel_title
                    FROM media m JOIN channels c ON c.id=m.channel_id
                    WHERE m.status='queued' AND c.enabled=1 AND c.paused=0
+                     AND (c.sequence_prefix=0 OR (c.scan_complete=1 AND EXISTS (
+                         SELECT 1 FROM attachment_sequence s WHERE s.channel_id=m.channel_id
+                           AND s.message_id=m.message_id AND s.sequence_number>0)))
                    ORDER BY c.priority_level, c.priority_rank, c.id,
                             m.priority_level, m.priority_rank, m.priority,
                             m.message_date DESC, m.id DESC LIMIT 1"""
@@ -447,6 +564,9 @@ class Database:
                 """SELECT m.*, c.identifier, c.folder, c.title AS channel_title
                    FROM media m JOIN channels c ON c.id=m.channel_id
                    WHERE m.status='queued' AND c.enabled=1 AND c.paused=0
+                     AND (c.sequence_prefix=0 OR (c.scan_complete=1 AND EXISTS (
+                         SELECT 1 FROM attachment_sequence s WHERE s.channel_id=m.channel_id
+                           AND s.message_id=m.message_id AND s.sequence_number>0)))
                      AND NOT EXISTS (SELECT 1 FROM media WHERE status='downloading')
                    ORDER BY c.priority_level, c.priority_rank, c.id,
                             m.priority_level, m.priority_rank, m.priority,
@@ -466,6 +586,45 @@ class Database:
     def update_progress(self, media_id: int, downloaded: int) -> None:
         with self.connect() as conn:
             conn.execute("UPDATE media SET bytes_downloaded=? WHERE id=?", (downloaded, media_id))
+
+    def set_output_path(self, media_id: int, output_path: str) -> None:
+        """Remember the destination so resumed downloads keep their original padding."""
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE media SET output_path=? WHERE id=? AND status='downloading'",
+                (output_path, media_id),
+            )
+
+    def media_for_ids(self, channel_id: int, media_ids: list[int]) -> list[sqlite3.Row]:
+        if not media_ids:
+            return []
+        marks = ",".join("?" for _ in media_ids)
+        with self.connect() as conn:
+            return conn.execute(
+                f"""SELECT m.*, c.identifier, c.folder, c.filename_mode AS channel_filename_mode
+                    FROM media m JOIN channels c ON c.id=m.channel_id
+                    WHERE m.channel_id=? AND m.id IN ({marks}) ORDER BY m.id""",
+                (channel_id, *media_ids),
+            ).fetchall()
+
+    def set_media_filename(
+        self, row: sqlite3.Row, mode: str, filename: str, output_path: str | None,
+        telegram_filename: str | None, message_filename: str | None, reply_filename: str | None = None,
+    ) -> None:
+        if mode not in ("telegram", "message", "reply", "manual"):
+            raise ValueError(f"Unknown filename mode: {mode}")
+        with self.connect() as conn:
+            changed = conn.execute(
+                """UPDATE media SET filename_mode=?, file_name=?, output_path=?,
+                   telegram_file_name=COALESCE(?,telegram_file_name),
+                   message_file_name=COALESCE(?,message_file_name), reply_file_name=COALESCE(?,reply_file_name)
+                   WHERE id=? AND status=? AND file_name=? AND output_path IS ?""",
+                (mode, filename, output_path, telegram_filename, message_filename, reply_filename,
+                 row["id"], row["status"], row["file_name"], row["output_path"]),
+            ).rowcount
+            if not changed:
+                raise RuntimeError("The file changed while renaming it; try again")
+        self._bump_revision()
 
     def mark_downloaded(self, media_id: int, output_path: str, size: int) -> bool:
         with self.connect() as conn:
@@ -577,26 +736,64 @@ class Database:
         if changed:
             self._bump_revision()
 
-    def media_for_channel(self, channel_id: int, limit: int = 500) -> list[sqlite3.Row]:
+    def _display_media_rows(
+        self, conn: sqlite3.Connection, channel_id: int, rows: list[sqlite3.Row],
+    ) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+        channel = conn.execute(
+            "SELECT filename_mode, sequence_prefix FROM channels WHERE id=?", (channel_id,),
+        ).fetchone()
+        numbers = {}
+        width = 1
+        if channel["sequence_prefix"]:
+            total = conn.execute(
+                "SELECT COALESCE(MAX(sequence_number),0) FROM attachment_sequence WHERE channel_id=?",
+                (channel_id,),
+            ).fetchone()[0]
+            width = len(str(total))
+            marks = ",".join("?" for _ in rows)
+            numbers = dict(conn.execute(
+                f"SELECT message_id,sequence_number FROM attachment_sequence WHERE channel_id=? AND message_id IN ({marks})",
+                (channel_id, *(row["message_id"] for row in rows)),
+            ).fetchall())
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["effective_filename_mode"] = row["filename_mode"] or channel["filename_mode"]
+            item["display_file_name"] = row["file_name"]
+            output = Path(row["output_path"]) if row["output_path"] else None
+            prefix = saved_sequence_prefix(output, row["file_name"], row["message_id"]) if output else ""
+            if output and (row["status"] == "downloaded" or prefix or not channel["sequence_prefix"]):
+                item["display_file_name"] = output.name
+            elif channel["sequence_prefix"] and numbers.get(row["message_id"], 0):
+                number = numbers[row["message_id"]]
+                item["display_file_name"] = unique_output_path(
+                    Path("."), row["file_name"], row["message_id"], f"{number:0{width}d} ",
+                ).name
+            result.append(item)
+        return result
+
+    def media_for_channel(self, channel_id: int, limit: int = 500) -> list[dict[str, Any]]:
         with self.connect() as conn:
-            return list(conn.execute(
+            return self._display_media_rows(conn, channel_id, list(conn.execute(
                 """SELECT * FROM media WHERE channel_id=?
                    ORDER BY CASE status WHEN 'downloading' THEN 0 WHEN 'queued' THEN 1
                      WHEN 'failed' THEN 2 ELSE 3 END,
                    priority_level, priority_rank, priority,
                    message_date DESC, id DESC LIMIT ?""", (channel_id, limit)
-            ))
+            )))
 
-    def pending_media_for_channel(self, channel_id: int, limit: int = 500, offset: int = 0) -> list[sqlite3.Row]:
+    def pending_media_for_channel(self, channel_id: int, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]:
         with self.connect() as conn:
-            return list(conn.execute(
+            return self._display_media_rows(conn, channel_id, list(conn.execute(
                 """SELECT * FROM media
                    WHERE channel_id=? AND status NOT IN ('downloaded','removed')
                    ORDER BY CASE status WHEN 'downloading' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
                    priority_level, priority_rank, priority,
                    message_date DESC, id DESC LIMIT ? OFFSET ?""",
                 (channel_id, limit, offset),
-            ))
+            )))
 
     @staticmethod
     def _name_filter(search_query: str | None) -> tuple[str, tuple[str, ...]]:
@@ -625,7 +822,7 @@ class Database:
                                  offset: int = 0,
                                  search_query: str | None = None,
                                  sort_column: str | None = None,
-                                 descending: bool = False) -> list[sqlite3.Row]:
+                                 descending: bool = False) -> list[dict[str, Any]]:
         name_sql, name_params = self._name_filter(search_query)
         order = self._media_order(
             sort_column, descending,
@@ -633,57 +830,57 @@ class Database:
             "priority_level, priority_rank, priority, message_date DESC, id DESC",
         )
         with self.connect() as conn:
-            return list(conn.execute(
+            return self._display_media_rows(conn, channel_id, list(conn.execute(
                    f"""SELECT * FROM media WHERE channel_id=? AND status IN ('queued','downloading')
                    {name_sql}
                    ORDER BY {order} LIMIT ? OFFSET ?""",
                 (channel_id, *name_params, limit, offset),
-            ))
+            )))
 
     def failed_media_for_channel(self, channel_id: int, limit: int = 250,
                                  offset: int = 0,
                                  search_query: str | None = None,
                                  sort_column: str | None = None,
-                                 descending: bool = False) -> list[sqlite3.Row]:
+                                 descending: bool = False) -> list[dict[str, Any]]:
         name_sql, name_params = self._name_filter(search_query)
         order = self._media_order(sort_column, descending, "message_date DESC, id DESC")
         with self.connect() as conn:
-            return list(conn.execute(
+            return self._display_media_rows(conn, channel_id, list(conn.execute(
                 f"""SELECT * FROM media WHERE channel_id=? AND status='failed'
                    {name_sql}
                    ORDER BY {order} LIMIT ? OFFSET ?""",
                 (channel_id, *name_params, limit, offset),
-            ))
+            )))
 
     def downloaded_media_for_channel(self, channel_id: int, limit: int = 250,
                                      offset: int = 0,
                                      search_query: str | None = None,
                                      sort_column: str | None = None,
-                                     descending: bool = False) -> list[sqlite3.Row]:
+                                     descending: bool = False) -> list[dict[str, Any]]:
         name_sql, name_params = self._name_filter(search_query)
         order = self._media_order(sort_column, descending, "downloaded_at DESC, id DESC")
         with self.connect() as conn:
-            return list(conn.execute(
+            return self._display_media_rows(conn, channel_id, list(conn.execute(
                 f"""SELECT * FROM media WHERE channel_id=? AND status='downloaded'
                    {name_sql}
                    ORDER BY {order} LIMIT ? OFFSET ?""",
                 (channel_id, *name_params, limit, offset),
-            ))
+            )))
 
     def removed_media_for_channel(self, channel_id: int, limit: int = 250,
                                   offset: int = 0,
                                   search_query: str | None = None,
                                   sort_column: str | None = None,
-                                  descending: bool = False) -> list[sqlite3.Row]:
+                                  descending: bool = False) -> list[dict[str, Any]]:
         name_sql, name_params = self._name_filter(search_query)
         order = self._media_order(sort_column, descending, "message_date DESC, id DESC")
         with self.connect() as conn:
-            return list(conn.execute(
+            return self._display_media_rows(conn, channel_id, list(conn.execute(
                 f"""SELECT * FROM media WHERE channel_id=? AND status='removed'
                    {name_sql}
                    ORDER BY {order} LIMIT ? OFFSET ?""",
                 (channel_id, *name_params, limit, offset),
-            ))
+            )))
 
     def status_count(self, channel_id: int, status: str,
                      search_query: str | None = None) -> int:
